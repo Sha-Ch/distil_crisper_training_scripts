@@ -206,7 +206,7 @@ datasets:
     text_column: "text"
 
 # -----------------------------------------------------------------------------
-# Training Hyperparameters - 4x H100 NVL (94GB each)
+# Training Hyperparameters - Scales automatically with GPU count (4-6 GPUs)
 # Matching official distil-whisper v3.5 methodology
 # -----------------------------------------------------------------------------
 training:
@@ -215,12 +215,16 @@ training:
 
   # Effective batch size = per_device * accumulation * num_gpus
   # Official v3.5 uses 4096 on 64 H100s
-  # With 4x H100, we maximize: 32 * 8 * 4 = 1024 (closer to official)
+  # Scales UP with more GPUs (more throughput!):
+  #   4x H100: 32 * 8 * 4 = 1024 effective batch
+  #   5x H100: 32 * 8 * 5 = 1280 effective batch
+  #   6x H100: 32 * 8 * 6 = 1536 effective batch (50% more throughput!)
   per_device_train_batch_size: 32
   gradient_accumulation_steps: 8
 
-  # Number of GPUs
-  num_gpus: 4
+  # Number of GPUs - auto-detected at runtime, this is just for reference
+  # Supports 4-6 GPUs (or more). Scripts auto-scale to available GPUs.
+  num_gpus: 4  # Will be overridden by actual GPU count
 
   # Learning rate schedule - OFFICIAL USES LINEAR
   learning_rate: 1.0e-4
@@ -344,6 +348,7 @@ logging:
 
 # -----------------------------------------------------------------------------
 # Multi-GPU Settings (Accelerate / DeepSpeed)
+# Auto-scales from 4 to 6+ GPUs
 # -----------------------------------------------------------------------------
 multi_gpu:
   # Use accelerate for distributed training
@@ -358,6 +363,12 @@ multi_gpu:
 
   # NCCL settings for multi-GPU communication
   nccl_debug: false
+
+  # Auto-scaling settings
+  # min_gpus: minimum GPUs required (will warn if fewer available)
+  # max_gpus: maximum GPUs to use (0 = use all available)
+  min_gpus: 4
+  max_gpus: 0  # Use all available GPUs
 
 # -----------------------------------------------------------------------------
 # CTranslate2 Conversion Settings

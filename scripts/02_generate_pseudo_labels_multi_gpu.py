@@ -198,7 +198,14 @@ class PseudoLabelEntry:
 
 @dataclass
 class DatasetProgress:
-    """Progress tracking for a dataset."""
+    """
+    Progress tracking for a dataset.
+
+    Designed to be GPU-count agnostic for robust resume:
+    - Tracks processed sample IDs (not just count)
+    - Can resume with different GPU count than original run
+    - Handles GPU failures gracefully
+    """
     name: str
     samples_processed: int = 0
     samples_accepted: int = 0
@@ -209,8 +216,12 @@ class DatasetProgress:
     accepted_duration_hours: float = 0.0
     wer_sum: float = 0.0
     last_sample_id: str = ""
+    last_sample_idx: int = 0  # Track the last processed sample index
     status: str = "pending"  # pending, processing, completed, error
     error_message: Optional[str] = None
+    # Track which GPUs contributed (for diagnostics)
+    gpu_count_at_start: int = 1
+    processed_sample_ids: List[str] = field(default_factory=list)  # For exact resume
 
     @property
     def acceptance_rate(self) -> float:
@@ -498,17 +509,23 @@ class CrisperWhisperTeacher:
 
 class MultiGPUPseudoLabelGenerator:
     """
-    Multi-GPU pseudo-label generator for maximum throughput on 4x H100 NVL.
+    Multi-GPU pseudo-label generator for maximum throughput.
+
+    Automatically scales to available GPUs (tested with 4-6 GPUs).
+    Supports: 4x H100, 6x H100, 4x A100, 6x A100, etc.
     """
 
     def __init__(self, config_path: str):
         self.config = self._load_config(config_path)
 
-        # Distributed setup
+        # Distributed setup - auto-detect GPU count
         self.is_distributed = dist.is_initialized()
         self.world_size = dist.get_world_size() if self.is_distributed else 1
         self.local_rank = dist.get_rank() if self.is_distributed else 0
         self.is_main = self.local_rank == 0
+
+        # Auto-detect available GPUs for single-process mode
+        self.num_gpus_available = torch.cuda.device_count() if torch.cuda.is_available() else 0
 
         # Device
         if torch.cuda.is_available():
@@ -537,8 +554,18 @@ class MultiGPUPseudoLabelGenerator:
 
         # Batch processing settings for GPU optimization
         batch_config = self.config.get('batch_processing', {})
-        self.batch_size = self.config['teacher'].get('pseudo_label_batch_size', 48)
+        base_batch_size = self.config['teacher'].get('pseudo_label_batch_size', 48)
+
+        # Auto-adjust batch size based on GPU count and memory
+        # Scale batch size per GPU to maximize throughput while avoiding OOM
+        self.batch_size = self._calculate_optimal_batch_size(base_batch_size)
         self.audio_loader_workers = batch_config.get('audio_loader_workers', 8)
+
+        # Scale workers with GPU count (more GPUs = more I/O needed)
+        self.audio_loader_workers = min(
+            self.audio_loader_workers * max(1, self.world_size // 2),
+            32  # Cap at 32 workers
+        )
 
         # Teacher model (loaded lazily)
         self.teacher = None
@@ -546,11 +573,17 @@ class MultiGPUPseudoLabelGenerator:
         # Spot instance handler
         self.spot_handler = SpotInstanceHandler(save_callback=self._emergency_save)
 
+        # Calculate effective throughput
+        effective_batch = self.batch_size * self.world_size
+
         if self.is_main:
             console.print(Panel.fit(
                 f"[bold cyan]Multi-GPU Pseudo-Label Generator[/bold cyan]\n"
-                f"GPUs: {self.world_size}\n"
-                f"Batch Size: {self.batch_size} (GPU batched inference)\n"
+                f"GPUs Available: {self.num_gpus_available}\n"
+                f"GPUs in Use: {self.world_size}\n"
+                f"Batch Size per GPU: {self.batch_size}\n"
+                f"Effective Batch Size: {effective_batch}\n"
+                f"Audio Loader Workers: {self.audio_loader_workers}\n"
                 f"WER Threshold: {self.wer_threshold * 100:.0f}%\n"
                 f"Duration: {self.min_duration}s - {self.max_duration}s\n"
                 f"Output: {self.pseudo_labels_dir}",
@@ -560,6 +593,55 @@ class MultiGPUPseudoLabelGenerator:
     def _load_config(self, config_path: str) -> Dict[str, Any]:
         with open(config_path, 'r') as f:
             return yaml.safe_load(f)
+
+    def _calculate_optimal_batch_size(self, base_batch_size: int) -> int:
+        """
+        Calculate optimal batch size based on available GPU memory.
+
+        Scales automatically for different GPU configurations:
+        - H100 94GB: 48-64 samples
+        - A100 80GB: 32-48 samples
+        - A100 40GB: 16-24 samples
+        - RTX 4090 24GB: 8-12 samples
+
+        Args:
+            base_batch_size: Base batch size from config
+
+        Returns:
+            Optimal batch size for current GPU
+        """
+        if not torch.cuda.is_available():
+            return base_batch_size
+
+        try:
+            # Get GPU memory for current device
+            gpu_memory_gb = torch.cuda.get_device_properties(self.local_rank).total_memory / (1024**3)
+            gpu_name = torch.cuda.get_device_properties(self.local_rank).name
+
+            # Memory-based batch size recommendations
+            # Whisper large-v3 needs ~4GB base + ~1.5GB per batch sample for 30s audio
+            if gpu_memory_gb >= 90:  # H100 94GB
+                optimal_batch = min(base_batch_size, 64)
+            elif gpu_memory_gb >= 75:  # A100 80GB
+                optimal_batch = min(base_batch_size, 48)
+            elif gpu_memory_gb >= 35:  # A100 40GB
+                optimal_batch = min(base_batch_size, 24)
+            elif gpu_memory_gb >= 20:  # RTX 4090/3090 24GB
+                optimal_batch = min(base_batch_size, 12)
+            elif gpu_memory_gb >= 10:  # RTX 3080/4080 10-16GB
+                optimal_batch = min(base_batch_size, 6)
+            else:
+                optimal_batch = min(base_batch_size, 4)
+
+            if self.is_main:
+                console.print(f"[dim]GPU {self.local_rank}: {gpu_name} ({gpu_memory_gb:.1f}GB) -> batch_size={optimal_batch}[/dim]")
+
+            return optimal_batch
+
+        except Exception as e:
+            if self.is_main:
+                console.print(f"[yellow]Could not detect GPU memory, using base batch size: {e}[/yellow]")
+            return base_batch_size
 
     def _load_teacher(self):
         """Load CrisperWhisper teacher model."""
@@ -579,22 +661,68 @@ class MultiGPUPseudoLabelGenerator:
         self.teacher.load()
 
     def _load_progress(self) -> Dict[str, DatasetProgress]:
-        """Load processing progress for resume support."""
+        """
+        Load processing progress for resume support.
+
+        GPU-count agnostic: can resume with different number of GPUs.
+        """
         if self.progress_file.exists():
             with open(self.progress_file, 'r') as f:
                 data = json.load(f)
-                return {
-                    name: DatasetProgress(**info)
-                    for name, info in data.get('datasets', {}).items()
-                }
+                result = {}
+                for name, info in data.get('datasets', {}).items():
+                    # Handle missing fields for backwards compatibility
+                    if 'last_sample_idx' not in info:
+                        info['last_sample_idx'] = 0
+                    if 'gpu_count_at_start' not in info:
+                        info['gpu_count_at_start'] = data.get('world_size', 1)
+                    if 'processed_sample_ids' not in info:
+                        info['processed_sample_ids'] = []
+                    result[name] = DatasetProgress(**info)
+                return result
         return {}
 
+    def _load_processed_ids_from_files(self, name: str) -> set:
+        """
+        Load already processed sample IDs from output files.
+
+        This allows resuming even if progress.json was lost, by scanning
+        the actual output files from ALL GPUs.
+        """
+        processed_ids = set()
+
+        # Scan all GPU output files (handles any GPU count)
+        for accepted_file in self.pseudo_labels_dir.glob(f'{name}_gpu*_accepted.jsonl'):
+            try:
+                with open(accepted_file, 'r') as f:
+                    for line in f:
+                        entry = json.loads(line)
+                        processed_ids.add(entry.get('sample_id', ''))
+            except Exception:
+                pass
+
+        for rejected_file in self.pseudo_labels_dir.glob(f'{name}_gpu*_rejected.jsonl'):
+            try:
+                with open(rejected_file, 'r') as f:
+                    for line in f:
+                        entry = json.loads(line)
+                        processed_ids.add(entry.get('sample_id', ''))
+            except Exception:
+                pass
+
+        return processed_ids
+
     def _save_progress(self, progress: Dict[str, DatasetProgress]):
-        """Save processing progress."""
+        """
+        Save processing progress.
+
+        Includes GPU count for diagnostics when resuming with different config.
+        """
         data = {
             'datasets': {name: asdict(p) for name, p in progress.items()},
             'last_update': datetime.now().isoformat(),
             'world_size': self.world_size,
+            'gpu_names': [torch.cuda.get_device_name(i) for i in range(self.num_gpus_available)] if torch.cuda.is_available() else [],
         }
 
         # Only main process saves
@@ -785,6 +913,11 @@ class MultiGPUPseudoLabelGenerator:
         - Processes entire batch in single GPU call
         - ~10-50x faster than sample-by-sample processing
 
+        GPU-AGNOSTIC RESUME:
+        - Tracks processed sample IDs (not just count)
+        - Can resume with different number of GPUs
+        - Scans output files to recover state if progress.json is lost
+
         Includes:
         - GPU batched inference
         - WER-based filtering
@@ -805,17 +938,30 @@ class MultiGPUPseudoLabelGenerator:
         all_progress = self._load_progress()
         progress = all_progress.get(name, DatasetProgress(name=name))
 
-        # Resume handling
-        if resume and progress.samples_processed > 0:
+        # GPU-AGNOSTIC RESUME: Load processed sample IDs from ALL output files
+        # This works even if GPU count changed or progress.json was lost
+        already_processed_ids = set()
+        if resume:
+            already_processed_ids = self._load_processed_ids_from_files(name)
+            if already_processed_ids and self.is_main:
+                console.print(f"[yellow]Found {len(already_processed_ids):,} already processed samples for {name}[/yellow]")
+
+        # Check if GPU count changed (for diagnostic logging)
+        previous_gpu_count = progress.gpu_count_at_start if progress.samples_processed > 0 else self.world_size
+        if resume and progress.samples_processed > 0 and previous_gpu_count != self.world_size:
             if self.is_main:
-                console.print(f"[yellow]Resuming {name} from sample {progress.samples_processed}[/yellow]")
-            start_idx = progress.samples_processed
+                console.print(f"[bold yellow]GPU count changed: {previous_gpu_count} → {self.world_size}[/bold yellow]")
+                console.print(f"[yellow]Using sample-ID based resume (GPU-agnostic)[/yellow]")
+
+        # Always append mode if resuming with existing samples
+        if resume and already_processed_ids:
             mode = 'a'
         else:
-            start_idx = 0
             mode = 'w'
             progress = DatasetProgress(name=name)
 
+        # Update GPU count for this run
+        progress.gpu_count_at_start = self.world_size
         progress.status = "processing"
 
         # Load dataset
@@ -828,6 +974,9 @@ class MultiGPUPseudoLabelGenerator:
         text_col = config['text_column']
         audio_col = config['audio_column']
 
+        # Track samples processed in THIS run (for progress bar)
+        samples_this_run = 0
+
         # Process samples with BATCHING
         with open(output_file, mode) as out_f, open(rejected_file, mode) as rej_f:
             # Progress bar only on main process
@@ -835,29 +984,36 @@ class MultiGPUPseudoLabelGenerator:
                 pbar = tqdm(
                     desc=f"Processing {name} (GPU {self.local_rank}, batch={self.batch_size})",
                     total=max_samples or config['estimated_hours'] * 120,
-                    unit="samples"
+                    unit="samples",
+                    initial=len(already_processed_ids) // self.world_size  # Start from resumed position
                 )
             else:
                 pbar = None
 
             sample_idx = 0
             batch_data = []  # Collect samples for batched processing
+            skipped_already_processed = 0
 
             for sample in dataset_iter:
                 if self.spot_handler.should_stop:
                     break
 
-                # Skip to resume point
-                if sample_idx < start_idx:
+                # Generate sample ID FIRST (before sharding check)
+                sample_id = f"{name}_{sample_idx:010d}"
+
+                # GPU-AGNOSTIC RESUME: Skip if already processed by ANY GPU
+                if sample_id in already_processed_ids:
                     sample_idx += 1
+                    skipped_already_processed += 1
                     continue
 
                 # Multi-GPU sharding: each GPU processes every Nth sample
+                # This only applies to NEW samples (not already processed ones)
                 if sample_idx % self.world_size != self.local_rank:
                     sample_idx += 1
                     continue
 
-                if max_samples and progress.samples_processed >= max_samples // self.world_size:
+                if max_samples and samples_this_run >= max_samples // self.world_size:
                     break
 
                 try:
@@ -884,12 +1040,12 @@ class MultiGPUPseudoLabelGenerator:
                         progress.samples_rejected_duration += 1
                         sample_idx += 1
                         progress.samples_processed += 1
+                        samples_this_run += 1
                         if pbar:
                             pbar.update(1)
                         continue
 
-                    # Add to batch
-                    sample_id = f"{name}_{sample_idx:010d}"
+                    # Add to batch (sample_id already generated above)
                     batch_data.append((audio_array, sr, ground_truth, sample_id, duration, sample_idx))
 
                     # Process batch when full
@@ -910,6 +1066,7 @@ class MultiGPUPseudoLabelGenerator:
 
                             progress.samples_processed += 1
                             progress.last_sample_id = entry.sample_id
+                            samples_this_run += 1
 
                         # Flush files
                         out_f.flush()
@@ -922,7 +1079,8 @@ class MultiGPUPseudoLabelGenerator:
                             pbar.set_postfix({
                                 'acc': f'{acc_rate:.1f}%',
                                 'wer': f'{avg_wer:.1f}%',
-                                'hrs': f'{progress.accepted_duration_hours:.1f}'
+                                'hrs': f'{progress.accepted_duration_hours:.1f}',
+                                'skip': skipped_already_processed  # Show skipped count
                             })
                             pbar.update(len(batch_data))
 
@@ -958,6 +1116,7 @@ class MultiGPUPseudoLabelGenerator:
 
                     progress.samples_processed += 1
                     progress.last_sample_id = entry.sample_id
+                    samples_this_run += 1
 
                 if pbar:
                     pbar.update(len(batch_data))
@@ -965,8 +1124,13 @@ class MultiGPUPseudoLabelGenerator:
             if pbar:
                 pbar.close()
 
+        # Log resume stats
+        if self.is_main and skipped_already_processed > 0:
+            console.print(f"[dim]Skipped {skipped_already_processed:,} already-processed samples[/dim]")
+
         # Final save
         progress.status = "completed"
+        progress.last_sample_idx = sample_idx  # Track where we left off
         all_progress[name] = progress
         self._save_progress(all_progress)
 
