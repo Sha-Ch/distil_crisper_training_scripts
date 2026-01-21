@@ -9,6 +9,7 @@
 # - 196,000 hours raw audio → 98,000 hours after WER filtering
 # - 8 datasets: Common Voice, VoxPopuli, AMI, People's Speech,
 #              TED-LIUM, GigaSpeech, LibriSpeech, YODAS
+# + CrisperWhisper filler dataset: PodcastFillers (for verbatim transcription)
 # - 2 decoder layers (for 6x speed) or 16 layers (for max quality)
 # - 80k training steps
 # - SpecAugment data augmentation
@@ -148,6 +149,7 @@ datasets:
     text_column: "normalized_text"
 
   # 4. AMI (100 hours) - ~5GB - Meeting recordings
+  # NOTE: This is also used by CrisperWhisper for verbatim/filler training
   ami:
     enabled: true
     name: "edinburghcstr/ami"
@@ -156,6 +158,24 @@ datasets:
     streaming: false  # DOWNLOAD - tiny dataset
     hours: 100
     text_column: "text"
+    verbatim: true  # Has filler words (um, uh)
+
+  # ==========================================================================
+  # CRISPERWHISPER OFFICIAL FILLER DATASET
+  # ==========================================================================
+  # PodcastFillers - Official CrisperWhisper dataset for filler word training
+  # Paper: "approximately 35,000 instances of filler words"
+  # Expanded to ~105,000 samples via context sampling
+  podcast_fillers:
+    enabled: true
+    name: "ylacombe/podcast_fillers_by_license"
+    subset: null
+    split: "train"
+    streaming: false  # DOWNLOAD - small dataset
+    hours: 145
+    text_column: "text"
+    verbatim: true  # Has filler words (um, uh)
+    has_filler_annotations: true
 
   # 5. TED-LIUM (450 hours) - ~25GB - TED talks
   tedlium:

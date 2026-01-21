@@ -71,11 +71,66 @@ warnings.filterwarnings('ignore')
 console = Console()
 
 # =============================================================================
-# Dataset Configurations - All 8 from Official Distil-Whisper v3.5
+# Dataset Configurations
+# =============================================================================
+# Includes:
+# - All 8 datasets from Official Distil-Whisper v3.5 (~196,000 hours)
+# - CrisperWhisper's official filler/verbatim datasets (AMI-IHM, PodcastFillers)
+#
+# References:
+# - Distil-Whisper: https://arxiv.org/abs/2311.00430
+# - CrisperWhisper: https://arxiv.org/abs/2408.16589
 # =============================================================================
 
 DATASET_CONFIGS = {
-    # Priority 1: High quality, clean audio
+    # =========================================================================
+    # CRISPERWHISPER OFFICIAL FILLER DATASETS (verbatim transcriptions)
+    # These are CRITICAL for preserving filler word transcription capability
+    # Source: arxiv.org/abs/2408.16589
+    # =========================================================================
+
+    # AMI Meeting Corpus - IHM (Individual Headset Microphone)
+    # ~29,000 meeting recording clips with verbatim transcriptions
+    # Contains natural fillers (um, uh), disfluencies, and word-level timestamps
+    # This is one of the PRIMARY datasets used by CrisperWhisper
+    'ami_verbatim': {
+        'hf_name': 'edinburghcstr/ami',
+        'subset': 'ihm',
+        'splits': ['train'],
+        'text_column': 'text',
+        'audio_column': 'audio',
+        'estimated_hours': 100,
+        'requires_auth': False,
+        'priority': 1,  # Highest priority - critical for filler preservation
+        'quality': 'high',
+        'verbatim': True,
+        'has_fillers': True,
+    },
+
+    # PodcastFillers - Filler word detection dataset
+    # ~35,000 filler instances (um, uh) with timing annotations
+    # CrisperWhisper expands this to ~105,000 samples via context sampling
+    # Source: https://huggingface.co/datasets/ylacombe/podcast_fillers_by_license
+    'podcast_fillers': {
+        'hf_name': 'ylacombe/podcast_fillers_by_license',
+        'subset': None,
+        'splits': ['train'],
+        'text_column': 'text',
+        'audio_column': 'audio',
+        'estimated_hours': 145,
+        'requires_auth': False,
+        'priority': 2,  # High priority - explicit filler annotations
+        'quality': 'high',
+        'verbatim': True,
+        'has_fillers': True,
+        'filler_annotations': True,
+    },
+
+    # =========================================================================
+    # DISTIL-WHISPER v3.5 DATASETS (~196,000 hours)
+    # =========================================================================
+
+    # Priority 3: High quality, clean audio (LibriSpeech)
     'librispeech': {
         'hf_name': 'librispeech_asr',
         'subset': None,
@@ -84,11 +139,11 @@ DATASET_CONFIGS = {
         'audio_column': 'audio',
         'estimated_hours': 960,
         'requires_auth': False,
-        'priority': 1,
+        'priority': 3,
         'quality': 'high',
     },
 
-    # Priority 2: Large scale, diverse
+    # Priority 4: Large scale, diverse (GigaSpeech)
     'gigaspeech': {
         'hf_name': 'speechcolab/gigaspeech',
         'subset': 'xl',  # Full 10,000 hours
@@ -97,11 +152,11 @@ DATASET_CONFIGS = {
         'audio_column': 'audio',
         'estimated_hours': 10000,
         'requires_auth': True,
-        'priority': 2,
+        'priority': 4,
         'quality': 'high',
     },
 
-    # Priority 3: European Parliament - formal speech
+    # Priority 5: European Parliament - formal speech (VoxPopuli)
     'voxpopuli': {
         'hf_name': 'facebook/voxpopuli',
         'subset': 'en',
@@ -110,11 +165,11 @@ DATASET_CONFIGS = {
         'audio_column': 'audio',
         'estimated_hours': 1800,
         'requires_auth': False,
-        'priority': 3,
+        'priority': 5,
         'quality': 'high',
     },
 
-    # Priority 4: Crowdsourced - diverse speakers
+    # Priority 6: Crowdsourced - diverse speakers (Common Voice)
     'common_voice': {
         'hf_name': 'mozilla-foundation/common_voice_17_0',
         'subset': 'en',
@@ -123,11 +178,11 @@ DATASET_CONFIGS = {
         'audio_column': 'audio',
         'estimated_hours': 3000,
         'requires_auth': True,
-        'priority': 4,
+        'priority': 6,
         'quality': 'medium',
     },
 
-    # Priority 5: TED talks - clear speech
+    # Priority 7: TED talks - clear speech (TED-LIUM)
     'tedlium': {
         'hf_name': 'LIUM/tedlium',
         'subset': 'release3',
@@ -136,24 +191,11 @@ DATASET_CONFIGS = {
         'audio_column': 'audio',
         'estimated_hours': 450,
         'requires_auth': False,
-        'priority': 5,
+        'priority': 7,
         'quality': 'high',
     },
 
-    # Priority 6: Meeting recordings
-    'ami': {
-        'hf_name': 'edinburghcstr/ami',
-        'subset': 'ihm',
-        'splits': ['train'],
-        'text_column': 'text',
-        'audio_column': 'audio',
-        'estimated_hours': 100,
-        'requires_auth': False,
-        'priority': 6,
-        'quality': 'medium',
-    },
-
-    # Priority 7: Large scale diverse
+    # Priority 8: Large scale diverse (People's Speech)
     'peoples_speech': {
         'hf_name': 'MLCommons/peoples_speech',
         'subset': 'clean',
@@ -162,11 +204,11 @@ DATASET_CONFIGS = {
         'audio_column': 'audio',
         'estimated_hours': 30000,
         'requires_auth': True,
-        'priority': 7,
+        'priority': 8,
         'quality': 'medium',
     },
 
-    # Priority 8: Massive YouTube dataset (bulk of data)
+    # Priority 9: Massive YouTube dataset - bulk of data (YODAS)
     'yodas': {
         'hf_name': 'espnet/yodas',
         'subset': 'en000',
@@ -175,7 +217,7 @@ DATASET_CONFIGS = {
         'audio_column': 'audio',
         'estimated_hours': 150000,
         'requires_auth': False,
-        'priority': 8,
+        'priority': 9,
         'quality': 'variable',
     },
 }
