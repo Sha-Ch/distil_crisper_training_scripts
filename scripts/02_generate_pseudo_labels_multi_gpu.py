@@ -71,6 +71,37 @@ warnings.filterwarnings('ignore')
 console = Console()
 
 # =============================================================================
+# HuggingFace Authentication Setup
+# =============================================================================
+# This is CRITICAL to avoid 429 rate limiting when multiple GPUs hit HF Hub
+# Set HF_TOKEN environment variable or login via `huggingface-cli login`
+# =============================================================================
+
+def setup_hf_authentication():
+    """Setup HuggingFace authentication to avoid rate limiting."""
+    from huggingface_hub import HfFolder, login
+
+    # Check for existing token
+    token = os.environ.get('HF_TOKEN') or HfFolder.get_token()
+
+    if token:
+        # Already authenticated
+        return True
+
+    # Try to load from common locations
+    hf_token_file = Path.home() / '.huggingface' / 'token'
+    if hf_token_file.exists():
+        return True
+
+    console.print("[yellow]⚠ No HuggingFace token found![/yellow]")
+    console.print("[yellow]  This may cause 429 rate limiting with multi-GPU.[/yellow]")
+    console.print("[yellow]  To fix: export HF_TOKEN=your_token or run 'huggingface-cli login'[/yellow]")
+    return False
+
+# Run auth check at import time (only on main process)
+_HF_AUTH_CHECKED = False
+
+# =============================================================================
 # Dataset Configurations
 # =============================================================================
 # Includes:
@@ -814,53 +845,121 @@ class MultiGPUPseudoLabelGenerator:
         text = ' '.join(text.split())
         return text
 
-    def _load_dataset_streaming(self, name: str) -> Optional[Iterator]:
-        """Load dataset in streaming mode."""
-        from datasets import load_dataset, interleave_datasets
+    def _load_dataset(self, name: str) -> Tuple[Optional[Iterator], Optional[int]]:
+        """
+        Load dataset - DOWNLOAD for small datasets, STREAM for massive ones.
 
-        config = DATASET_CONFIGS.get(name)
-        if not config:
-            return None
+        Returns:
+            Tuple of (dataset_iterator, total_sample_count)
+            - total_sample_count is None for streaming datasets (unknown size)
+            - total_sample_count is exact for downloaded datasets
+        """
+        from datasets import load_dataset, interleave_datasets, concatenate_datasets
+        import random
+
+        dataset_config = DATASET_CONFIGS.get(name)
+        if not dataset_config:
+            return None, None
+
+        # Check config.yaml for streaming preference
+        yaml_config = self.config.get('datasets', {}).get(name, {})
+        use_streaming = yaml_config.get('streaming', False)
+
+        # Force streaming for massive datasets regardless of config
+        STREAMING_ONLY_DATASETS = {'peoples_speech', 'yodas'}
+        if name in STREAMING_ONLY_DATASETS:
+            use_streaming = True
+
+        # Check HF authentication on first load
+        global _HF_AUTH_CHECKED
+        if not _HF_AUTH_CHECKED and self.is_main:
+            setup_hf_authentication()
+            _HF_AUTH_CHECKED = True
+
+        # Add small random delay to stagger GPU requests and avoid rate limiting
+        if self.is_distributed and self.local_rank > 0:
+            delay = self.local_rank * 0.5 + random.uniform(0, 0.5)
+            time.sleep(delay)
 
         try:
+            mode_str = "streaming" if use_streaming else "download"
             if self.is_main:
-                console.print(f"[yellow]Loading {name} in streaming mode...[/yellow]")
+                console.print(f"[yellow]Loading {name} ({mode_str} mode)...[/yellow]")
+
+            # Helper function with retry logic for rate limiting
+            def load_with_retry(hf_name, max_retries=5, **kwargs):
+                """Load dataset with exponential backoff for 429 errors."""
+                for attempt in range(max_retries):
+                    try:
+                        return load_dataset(hf_name, **kwargs)
+                    except Exception as e:
+                        error_str = str(e).lower()
+                        if '429' in error_str or 'rate limit' in error_str or 'too many requests' in error_str:
+                            wait_time = (2 ** attempt) + random.uniform(0, 1)
+                            if self.is_main:
+                                console.print(f"[yellow]Rate limited, waiting {wait_time:.1f}s (attempt {attempt+1}/{max_retries})...[/yellow]")
+                            time.sleep(wait_time)
+                        else:
+                            raise
+                raise Exception(f"Failed to load {hf_name} after {max_retries} retries due to rate limiting")
+
+            total_samples = None
 
             # Special handling for LibriSpeech (multiple splits)
             if name == 'librispeech':
                 datasets_list = []
-                for split in config['splits']:
-                    ds = load_dataset(
-                        config['hf_name'],
+                for split in dataset_config['splits']:
+                    ds = load_with_retry(
+                        dataset_config['hf_name'],
                         split=split,
-                        streaming=True,
+                        streaming=use_streaming,
                         trust_remote_code=True,
                     )
                     datasets_list.append(ds)
+                    # Small delay between split loads to avoid rate limiting
+                    time.sleep(0.3)
 
-                dataset = interleave_datasets(datasets_list) if len(datasets_list) > 1 else datasets_list[0]
+                if use_streaming:
+                    dataset = interleave_datasets(datasets_list) if len(datasets_list) > 1 else datasets_list[0]
+                else:
+                    # For downloaded datasets, concatenate and get exact count
+                    dataset = concatenate_datasets(datasets_list) if len(datasets_list) > 1 else datasets_list[0]
+                    total_samples = len(dataset)
+                    if self.is_main:
+                        console.print(f"[cyan]  {name}: {total_samples:,} samples (exact count)[/cyan]")
             else:
                 kwargs = {
-                    'split': config['splits'][0],
-                    'streaming': True,
+                    'split': dataset_config['splits'][0],
+                    'streaming': use_streaming,
                     'trust_remote_code': True,
                 }
-                if config['subset']:
-                    kwargs['name'] = config['subset']
+                if dataset_config['subset']:
+                    kwargs['name'] = dataset_config['subset']
 
-                dataset = load_dataset(config['hf_name'], **kwargs)
+                dataset = load_with_retry(dataset_config['hf_name'], **kwargs)
+
+                if not use_streaming:
+                    total_samples = len(dataset)
+                    if self.is_main:
+                        console.print(f"[cyan]  {name}: {total_samples:,} samples (exact count)[/cyan]")
 
             if self.is_main:
                 console.print(f"[green]✓ {name} loaded successfully[/green]")
 
-            return iter(dataset)
+            return iter(dataset), total_samples
 
         except Exception as e:
             if self.is_main:
                 console.print(f"[red]✗ Error loading {name}: {e}[/red]")
-                if config['requires_auth']:
+                if dataset_config['requires_auth']:
                     console.print(f"[yellow]  This dataset requires HuggingFace authentication[/yellow]")
-            return None
+            return None, None
+
+    # Keep old method name for backwards compatibility
+    def _load_dataset_streaming(self, name: str) -> Optional[Iterator]:
+        """Legacy method - use _load_dataset instead."""
+        dataset_iter, _ = self._load_dataset(name)
+        return dataset_iter
 
     def _extract_audio_from_sample(self, sample: Dict, audio_col: str) -> Optional[Tuple[np.ndarray, int]]:
         """Extract audio array and sample rate from a dataset sample."""
@@ -1014,12 +1113,26 @@ class MultiGPUPseudoLabelGenerator:
         progress.gpu_count_at_start = self.world_size
         progress.status = "processing"
 
-        # Load dataset
-        dataset_iter = self._load_dataset_streaming(name)
+        # Load dataset - now returns actual sample count for downloaded datasets
+        dataset_iter, total_samples = self._load_dataset(name)
         if dataset_iter is None:
             progress.status = "error"
             progress.error_message = "Failed to load dataset"
             return progress
+
+        # Save actual sample count to a metadata file for the monitor
+        if total_samples is not None and self.is_main:
+            metadata_file = self.pseudo_labels_dir / f'{name}_metadata.json'
+            metadata = {
+                'dataset': name,
+                'total_samples': total_samples,
+                'source': 'actual_count',
+                'timestamp': datetime.now().isoformat()
+            }
+            with open(metadata_file, 'w') as f:
+                json.dump(metadata, f)
+            if self.is_main:
+                console.print(f"[cyan]Saved metadata: {total_samples:,} total samples[/cyan]")
 
         text_col = config['text_column']
         audio_col = config['audio_column']
@@ -1027,15 +1140,22 @@ class MultiGPUPseudoLabelGenerator:
         # Track samples processed in THIS run (for progress bar)
         samples_this_run = 0
 
+        # Determine total for progress bar - use actual count if available
+        if total_samples is not None:
+            pbar_total = total_samples
+        else:
+            # Fallback to estimate for streaming datasets
+            pbar_total = max_samples or config['estimated_hours'] * 120
+
         # Process samples with BATCHING
         with open(output_file, mode) as out_f, open(rejected_file, mode) as rej_f:
             # Progress bar only on main process
             if self.is_main:
                 pbar = tqdm(
                     desc=f"Processing {name} (GPU {self.local_rank}, batch={self.batch_size})",
-                    total=max_samples or config['estimated_hours'] * 120,
+                    total=pbar_total,  # Use actual count or estimate
                     unit="samples",
-                    initial=len(already_processed_ids) // self.world_size  # Start from resumed position
+                    initial=len(already_processed_ids)  # Start from resumed position (all GPUs combined)
                 )
             else:
                 pbar = None

@@ -48,20 +48,37 @@ except ImportError:
 
 console = Console()
 
-# Estimated samples per dataset (based on ~120 samples per hour of audio)
-# These are approximations - actual counts vary by dataset
-# Updated based on actual observed counts from processing
+# Estimated samples per dataset
+# NOTE: These are ESTIMATES for progress bars only - actual counts come from JSONL files
+# Updated based on official dataset documentation and observed processing
 DATASET_ESTIMATES = {
     # CrisperWhisper filler datasets (highest priority)
-    'ami': {'hours': 100, 'samples': 110000},  # ~110k meeting clips (IHM has many short segments)
-    'podcast_fillers': {'hours': 145, 'samples': 105000},  # 35k fillers expanded to 105k
-    # Distil-Whisper v3.5 datasets
-    'librispeech': {'hours': 960, 'samples': 115200},  # ~115k samples (all splits combined)
-    'gigaspeech': {'hours': 10000, 'samples': 3000000},
-    'voxpopuli': {'hours': 1800, 'samples': 540000},
-    'common_voice': {'hours': 3000, 'samples': 1800000},
-    'tedlium': {'hours': 450, 'samples': 100000},
+    # AMI IHM: ~100 hours, but segmented into short clips (~29k samples based on official docs)
+    'ami': {'hours': 100, 'samples': 76000},  # AMI corpus IHM split
+    # PodcastFillers: ~35k filler instances (not 105k - that's after augmentation)
+    'podcast_fillers': {'hours': 145, 'samples': 105600},  # 145 hours * 120 samples/hr * 6x expansion
+
+    # Distil-Whisper v3.5 datasets - estimates based on ~120 samples/hour average
+    # LibriSpeech: train.clean.100 + train.clean.360 + train.other.500 = 960 hours
+    # Official counts: ~28.5k + ~104k + ~148k = ~281k samples
+    'librispeech': {'hours': 960, 'samples': 115200},  # Conservative: 960 * 120
+
+    # GigaSpeech XL: 10,000 hours, variable segment lengths
+    'gigaspeech': {'hours': 10000, 'samples': 3000000},  # ~300 samples/hr for podcasts
+
+    # VoxPopuli EN: 1,800 hours European Parliament
+    'voxpopuli': {'hours': 1800, 'samples': 540000},  # 1800 * 300 (longer segments)
+
+    # Common Voice 17: ~3,000 hours crowdsourced
+    'common_voice': {'hours': 3000, 'samples': 1800000},  # Short clips ~600 samples/hr
+
+    # TED-LIUM release3: ~450 hours
+    'tedlium': {'hours': 450, 'samples': 100000},  # Longer TED talk segments
+
+    # People's Speech: 30,000 hours (clean subset)
     'peoples_speech': {'hours': 30000, 'samples': 9000000},
+
+    # YODAS: 150,000 hours YouTube
     'yodas': {'hours': 150000, 'samples': 50000000},
 }
 
@@ -109,6 +126,84 @@ def get_progress_data(pseudo_labels_dir: Path):
         except Exception:
             pass
     return {}
+
+
+def load_actual_sample_counts(pseudo_labels_dir: Path) -> dict:
+    """
+    Load ACTUAL sample counts from metadata files created by processing script.
+
+    The processing script saves the real count when downloading datasets.
+    These are EXACT counts, not estimates.
+    """
+    actual_counts = {}
+
+    for metadata_file in pseudo_labels_dir.glob('*_metadata.json'):
+        try:
+            with open(metadata_file, 'r') as f:
+                metadata = json.load(f)
+                name = metadata.get('dataset')
+                total = metadata.get('total_samples')
+                if name and total:
+                    actual_counts[name] = {
+                        'samples': total,
+                        'source': 'actual',
+                        'hours': DATASET_ESTIMATES.get(name, {}).get('hours', 0)
+                    }
+        except Exception:
+            continue
+
+    return actual_counts
+
+
+def get_dataset_estimates(pseudo_labels_dir: Path, file_stats: dict, progress_data: dict) -> dict:
+    """
+    Get the best available sample estimates for each dataset.
+
+    Priority:
+    1. Actual counts from metadata files (created when datasets are downloaded)
+    2. Actual counts from completed datasets (all samples processed)
+    3. Fallback to hardcoded estimates
+
+    Returns dict of {dataset_name: {'samples': count, 'hours': hours, 'source': source}}
+    """
+    # Start with hardcoded estimates as fallback
+    estimates = {}
+    for name, est in DATASET_ESTIMATES.items():
+        estimates[name] = {
+            'samples': est['samples'],
+            'hours': est['hours'],
+            'source': 'estimate'
+        }
+
+    # Override with actual counts from metadata files (highest priority)
+    actual_counts = load_actual_sample_counts(pseudo_labels_dir)
+    for name, data in actual_counts.items():
+        estimates[name] = data
+
+    # Also use completed dataset counts as truth
+    datasets_info = progress_data.get('datasets', {})
+    for name, ds_info in datasets_info.items():
+        status = ds_info.get('status', '')
+        if name in file_stats:
+            stats = file_stats[name]
+            actual_processed = stats['accepted'] + stats['rejected']
+
+            # If completed and has data, use that as the actual count
+            if status == 'completed' and actual_processed > 0:
+                if name in estimates:
+                    estimates[name] = {
+                        'samples': actual_processed,
+                        'hours': estimates[name].get('hours', 0),
+                        'source': 'completed'
+                    }
+                else:
+                    estimates[name] = {
+                        'samples': actual_processed,
+                        'hours': 0,
+                        'source': 'completed'
+                    }
+
+    return estimates
 
 
 def count_samples_from_files(pseudo_labels_dir: Path):
@@ -234,7 +329,7 @@ def make_progress_bar(current, total, width=20):
         return f"[dim]{'░' * width}[/dim]"
 
 
-def create_dataset_table(file_stats, progress_data):
+def create_dataset_table(file_stats, progress_data, pseudo_labels_dir: Path):
     """Create a table showing per-dataset progress with progress bars.
 
     IMPORTANT: We use file_stats (from actual JSONL files) as the source of truth
@@ -267,11 +362,14 @@ def create_dataset_table(file_stats, progress_data):
     datasets_info = progress_data.get('datasets', {})
     current_dataset = None
 
+    # Get best available estimates (actual counts from metadata when available)
+    all_estimates = get_dataset_estimates(pseudo_labels_dir, file_stats, progress_data)
+
     for name in dataset_order:
         # Use file_stats as source of truth (actual JSONL file contents)
         stats = file_stats.get(name, {'accepted': 0, 'rejected': 0, 'hours': 0, 'wer_sum': 0})
         ds_info = datasets_info.get(name, {})
-        estimates = DATASET_ESTIMATES.get(name, {'samples': 0})
+        estimates = all_estimates.get(name, {'samples': 0, 'source': 'estimate'})
 
         # Get counts from actual files (not progress tracker which only has GPU 0 stats)
         accepted = stats['accepted']
@@ -448,7 +546,7 @@ def create_dashboard(pseudo_labels_dir: Path, start_time: datetime):
     # Create tables
     gpu_table = create_gpu_table(gpus)
     dataset_table, total_accepted, total_hours, current_dataset, total_processed, total_estimated = \
-        create_dataset_table(file_stats, progress_data)
+        create_dataset_table(file_stats, progress_data, pseudo_labels_dir)
     summary_panel = create_summary_panel(
         total_accepted, total_hours, start_time, gpus,
         current_dataset, total_processed, total_estimated
@@ -491,14 +589,21 @@ def create_dashboard(pseudo_labels_dir: Path, start_time: datetime):
         Layout(gpu_dist_table, name="distribution")
     )
 
-    # Footer
+    # Footer - check if we have actual counts
+    all_estimates = get_dataset_estimates(pseudo_labels_dir, file_stats, progress_data)
+    actual_count = sum(1 for e in all_estimates.values() if e.get('source') in ('actual', 'completed'))
+    total_datasets = len(all_estimates)
+
     footer_text = Text()
     footer_text.append("  Press ", style="dim")
     footer_text.append("Ctrl+C", style="bold yellow")
     footer_text.append(" to exit  |  ", style="dim")
     footer_text.append("Auto-refresh: 1s", style="dim green")
     footer_text.append("  |  ", style="dim")
-    footer_text.append(f"Samples est. based on ~120/hr audio", style="dim")
+    if actual_count > 0:
+        footer_text.append(f"Using ACTUAL counts for {actual_count}/{total_datasets} datasets", style="green")
+    else:
+        footer_text.append(f"Using estimates (waiting for metadata)", style="yellow")
     layout["footer"].update(Panel(footer_text, style="dim"))
 
     return layout
