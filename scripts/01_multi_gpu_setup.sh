@@ -157,15 +157,24 @@ install_python_deps() {
     # Upgrade pip
     pip install --upgrade pip -q
 
-    # Core ML libraries (compatible with H100)
-    pip install -q torch==2.2.0 torchaudio==2.2.0 --index-url https://download.pytorch.org/whl/cu121
+    # Core ML libraries (compatible with H100) - MUST install torch, torchvision, torchaudio together
+    # torchvision 0.17.0 is compatible with torch 2.2.0
+    echo -e "  Installing PyTorch stack (torch 2.2.0 + torchvision 0.17.0 + torchaudio 2.2.0)..."
+    pip install -q torch==2.2.0 torchvision==0.17.0 torchaudio==2.2.0 --index-url https://download.pytorch.org/whl/cu121
 
-    # Transformers ecosystem
+    # Pin numpy<2.0 for PyTorch 2.2.0 compatibility (PyTorch 2.2 was compiled with NumPy 1.x)
+    # Pin fsspec for datasets compatibility
+    echo -e "  Installing numpy and fsspec with version constraints..."
+    pip install -q "numpy<2.0" "fsspec>=2023.5.0,<=2025.10.0"
+
+    # Transformers ecosystem - pin transformers to avoid torchvision conflicts
+    # Pin datasets<3.0.0 to use soundfile for audio (not torchcodec which needs PyTorch 2.4+)
+    echo -e "  Installing transformers ecosystem..."
     pip install -q \
-        transformers>=4.40.0 \
-        datasets>=2.18.0 \
-        accelerate>=0.29.0 \
-        evaluate>=0.4.0
+        "transformers>=4.40.0,<4.50.0" \
+        "datasets>=2.18.0,<3.0.0" \
+        "accelerate>=0.29.0" \
+        "evaluate>=0.4.0"
 
     # Audio processing
     pip install -q \
@@ -194,9 +203,18 @@ install_python_deps() {
     # Verify key imports
     echo -e "  Verifying installations..."
     python3 -c "import torch; print(f'  PyTorch: {torch.__version__}')"
+    python3 -c "import torchvision; print(f'  TorchVision: {torchvision.__version__}')"
     python3 -c "import transformers; print(f'  Transformers: {transformers.__version__}')"
     python3 -c "import accelerate; print(f'  Accelerate: {accelerate.__version__}')"
     python3 -c "import datasets; print(f'  Datasets: {datasets.__version__}')"
+
+    # Verify Whisper imports work
+    echo -e "  Verifying Whisper model imports..."
+    python3 -c "from transformers import WhisperForConditionalGeneration, WhisperProcessor; print('  ✓ Whisper imports successful')"
+
+    # Verify audio decoding works (required by datasets library)
+    echo -e "  Verifying audio decoding (soundfile)..."
+    python3 -c "import soundfile; print(f'  SoundFile: {soundfile.__version__}')"
 }
 
 # -----------------------------------------------------------------------------
