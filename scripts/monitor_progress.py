@@ -52,7 +52,7 @@ console = Console()
 # These are approximations - actual counts vary by dataset
 DATASET_ESTIMATES = {
     # CrisperWhisper filler datasets (highest priority)
-    'ami_verbatim': {'hours': 100, 'samples': 29000},  # ~29k meeting clips
+    'ami': {'hours': 100, 'samples': 29000},  # ~29k meeting clips with fillers
     'podcast_fillers': {'hours': 145, 'samples': 105000},  # 35k fillers expanded to 105k
     # Distil-Whisper v3.5 datasets
     'librispeech': {'hours': 960, 'samples': 280000},
@@ -60,7 +60,6 @@ DATASET_ESTIMATES = {
     'voxpopuli': {'hours': 1800, 'samples': 540000},
     'common_voice': {'hours': 3000, 'samples': 1800000},
     'tedlium': {'hours': 450, 'samples': 100000},
-    'ami': {'hours': 100, 'samples': 30000},
     'peoples_speech': {'hours': 30000, 'samples': 9000000},
     'yodas': {'hours': 150000, 'samples': 50000000},
 }
@@ -251,9 +250,9 @@ def create_dataset_table(file_stats, progress_data):
     table.add_column("WER", justify="right", width=5)
     table.add_column("Status", justify="center", width=9)
 
-    # Dataset order by priority (filler datasets first)
-    dataset_order = ['ami_verbatim', 'podcast_fillers', 'librispeech', 'gigaspeech',
-                     'voxpopuli', 'common_voice', 'tedlium', 'ami', 'peoples_speech', 'yodas']
+    # Dataset order by priority (librispeech first to finish existing progress)
+    dataset_order = ['librispeech', 'ami', 'podcast_fillers', 'gigaspeech',
+                     'voxpopuli', 'common_voice', 'tedlium', 'peoples_speech', 'yodas']
 
     total_processed = 0
     total_estimated = 0

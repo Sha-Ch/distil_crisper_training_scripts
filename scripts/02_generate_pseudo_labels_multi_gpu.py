@@ -93,7 +93,7 @@ DATASET_CONFIGS = {
     # ~29,000 meeting recording clips with verbatim transcriptions
     # Contains natural fillers (um, uh), disfluencies, and word-level timestamps
     # This is one of the PRIMARY datasets used by CrisperWhisper
-    'ami_verbatim': {
+    'ami': {
         'hf_name': 'edinburghcstr/ami',
         'subset': 'ihm',
         'splits': ['train'],
@@ -101,7 +101,7 @@ DATASET_CONFIGS = {
         'audio_column': 'audio',
         'estimated_hours': 100,
         'requires_auth': False,
-        'priority': 1,  # Highest priority - critical for filler preservation
+        'priority': 2,  # High priority - critical for filler preservation
         'quality': 'high',
         'verbatim': True,
         'has_fillers': True,
@@ -119,7 +119,7 @@ DATASET_CONFIGS = {
         'audio_column': 'audio',
         'estimated_hours': 145,
         'requires_auth': False,
-        'priority': 2,  # High priority - explicit filler annotations
+        'priority': 3,  # High priority - explicit filler annotations
         'quality': 'high',
         'verbatim': True,
         'has_fillers': True,
@@ -130,7 +130,7 @@ DATASET_CONFIGS = {
     # DISTIL-WHISPER v3.5 DATASETS (~196,000 hours)
     # =========================================================================
 
-    # Priority 3: High quality, clean audio (LibriSpeech)
+    # Priority 1: High quality, clean audio (LibriSpeech) - finish existing progress first
     'librispeech': {
         'hf_name': 'librispeech_asr',
         'subset': None,
@@ -139,7 +139,7 @@ DATASET_CONFIGS = {
         'audio_column': 'audio',
         'estimated_hours': 960,
         'requires_auth': False,
-        'priority': 3,
+        'priority': 1,
         'quality': 'high',
     },
 
