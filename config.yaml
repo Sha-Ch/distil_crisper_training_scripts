@@ -113,85 +113,93 @@ student:
 # Total: ~196,000 hours raw → ~98,000 hours after WER filtering
 # -----------------------------------------------------------------------------
 datasets:
-  # 1. LibriSpeech (960 hours) - High quality read speech
+  # ==========================================================================
+  # DOWNLOAD DATASETS (<1TB total) - Faster processing, cached locally
+  # ==========================================================================
+
+  # 1. LibriSpeech (960 hours) - ~50GB - High quality read speech
   librispeech:
     enabled: true
     name: "librispeech_asr"
     subset: "all"  # train.clean.100 + train.clean.360 + train.other.500
     split: "train.clean.100+train.clean.360+train.other.500"
-    streaming: true
+    streaming: false  # DOWNLOAD - small dataset
     hours: 960
     text_column: "text"
 
-  # 2. Common Voice (3,000+ hours) - Crowdsourced multilingual
+  # 2. Common Voice (3,000+ hours) - ~150GB - Crowdsourced multilingual
   common_voice:
     enabled: true
     name: "mozilla-foundation/common_voice_17_0"
     subset: "en"
     split: "train"
-    streaming: true
+    streaming: false  # DOWNLOAD - medium dataset
     hours: 3000
     text_column: "sentence"
 
-  # 3. VoxPopuli (1,800 hours) - European Parliament
+  # 3. VoxPopuli (1,800 hours) - ~100GB - European Parliament
   voxpopuli:
     enabled: true
     name: "facebook/voxpopuli"
     subset: "en"
     split: "train"
-    streaming: true
+    streaming: false  # DOWNLOAD - medium dataset
     hours: 1800
     text_column: "normalized_text"
 
-  # 4. AMI (100 hours) - Meeting recordings
+  # 4. AMI (100 hours) - ~5GB - Meeting recordings
   ami:
     enabled: true
     name: "edinburghcstr/ami"
     subset: "ihm"  # Individual headset microphone (cleaner)
     split: "train"
-    streaming: true
+    streaming: false  # DOWNLOAD - tiny dataset
     hours: 100
     text_column: "text"
 
-  # 5. People's Speech (30,000 hours) - Large diverse dataset
-  peoples_speech:
-    enabled: true
-    name: "MLCommons/peoples_speech"
-    subset: "clean"  # Use clean subset
-    split: "train"
-    streaming: true
-    hours: 30000
-    text_column: "text"
-
-  # 6. TED-LIUM (450 hours) - TED talks
+  # 5. TED-LIUM (450 hours) - ~25GB - TED talks
   tedlium:
     enabled: true
     name: "LIUM/tedlium"
     subset: "release3"
     split: "train"
-    streaming: true
+    streaming: false  # DOWNLOAD - small dataset
     hours: 450
     text_column: "text"
 
-  # 7. GigaSpeech (10,000 hours) - Large scale English
+  # 6. GigaSpeech (10,000 hours) - ~500GB - Large scale English
   # NOTE: Requires access agreement on HuggingFace
   gigaspeech:
     enabled: true
     name: "speechcolab/gigaspeech"
     subset: "xl"  # Use XL for maximum data (10k hours)
     split: "train"
-    streaming: true
+    streaming: false  # DOWNLOAD - large but fits in 800GB storage
     hours: 10000
     text_column: "text"
 
-  # 8. YODAS (150,000 hours) - YouTube Open Dataset for ASR
+  # ==========================================================================
+  # STREAMING DATASETS (>1TB) - Too large to download, stream on-the-fly
+  # ==========================================================================
+
+  # 7. People's Speech (30,000 hours) - ~1.5TB - Large diverse dataset
+  peoples_speech:
+    enabled: true
+    name: "MLCommons/peoples_speech"
+    subset: "clean"  # Use clean subset
+    split: "train"
+    streaming: true  # STREAM - too large to download (~1.5TB)
+    hours: 30000
+    text_column: "text"
+
+  # 8. YODAS (150,000 hours) - ~8TB - YouTube Open Dataset for ASR
   # This is the LARGEST dataset - provides bulk of training data
   yodas:
     enabled: true
     name: "espnet/yodas"
     subset: "en000"  # English subset
     split: "train"
-    streaming: true
+    streaming: true  # STREAM - way too large to download (~8TB)
     hours: 150000
     text_column: "text"
 
