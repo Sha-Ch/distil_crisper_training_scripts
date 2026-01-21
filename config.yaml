@@ -1,0 +1,359 @@
+# =============================================================================
+# Distil-CrisperWhisper Training Configuration
+# =============================================================================
+# ALL-IN CONFIG: Matching Official Distil-Whisper v3.5 Methodology
+# Hardware: 4x H100 NVL (94GB each) on RunPod
+# Cost: ~$10.44/hr (spot) | Total budget: ~$900
+#
+# OFFICIAL DISTIL-WHISPER V3.5 SPECS:
+# - 196,000 hours raw audio → 98,000 hours after WER filtering
+# - 8 datasets: Common Voice, VoxPopuli, AMI, People's Speech,
+#              TED-LIUM, GigaSpeech, LibriSpeech, YODAS
+# - 2 decoder layers (for 6x speed) or 16 layers (for max quality)
+# - 80k training steps
+# - SpecAugment data augmentation
+# - Frozen encoder from teacher model
+# - WER < 10% filtering for pseudo-labels
+#
+# References:
+# - Model: https://huggingface.co/distil-whisper/distil-large-v3.5
+# - Paper: https://arxiv.org/abs/2311.00430
+# - Code: https://github.com/huggingface/distil-whisper
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Paths (will be set relative to cloud storage)
+# -----------------------------------------------------------------------------
+paths:
+  # Persistent storage mount point (RunPod: /workspace)
+  workspace: "/workspace"
+
+  # Where to store datasets (on persistent storage)
+  # NOTE: Full 196k hours requires ~4TB storage!
+  # With 800GB, we can do ~40k hours (still excellent results)
+  data_dir: "/workspace/data"
+
+  # Where to store model checkpoints
+  checkpoint_dir: "/workspace/checkpoints"
+
+  # Where to store the final converted model
+  output_dir: "/workspace/output"
+
+  # Cache directory for HuggingFace
+  hf_cache: "/workspace/hf_cache"
+
+  # Directory for pseudo-labels (separate for easy management)
+  pseudo_labels_dir: "/workspace/pseudo_labels"
+
+# -----------------------------------------------------------------------------
+# Teacher Model (CrisperWhisper)
+# -----------------------------------------------------------------------------
+teacher:
+  # CrisperWhisper model from HuggingFace (preserves word-level timestamps!)
+  model_id: "nyrahealth/CrisperWhisper"
+
+  # Use float16 for pseudo-labelling (saves VRAM)
+  dtype: "float16"
+
+  # Batch size for generating pseudo-labels per GPU
+  # 4x H100 NVL: 48 per device * 4 GPUs = 192 effective batch
+  pseudo_label_batch_size: 48
+
+  # Attention implementation (sdpa is fastest on H100)
+  attn_implementation: "sdpa"
+
+# -----------------------------------------------------------------------------
+# Student Model (Distilled) - MAXIMUM QUALITY CONFIG
+# -----------------------------------------------------------------------------
+student:
+  # Base architecture - we'll initialize from whisper-large-v3 structure
+  base_model: "openai/whisper-large-v3"
+
+  # Number of decoder layers in student (original has 32)
+  # Options:
+  #   2 layers  = 6x speedup (official distil-whisper-large-v3.5)
+  #   16 layers = 2x speedup but significantly better accuracy
+  # We use 2 to match official methodology
+  decoder_layers: 2
+
+  # Keep all encoder layers (32) - FROZEN during training
+  # This is CRITICAL for:
+  # 1. Quality - encoder is the "ears"
+  # 2. Speculative decoding compatibility
+  encoder_layers: 32
+
+  # Training dtype
+  dtype: "bfloat16"
+
+# -----------------------------------------------------------------------------
+# Datasets - ALL 8 FROM OFFICIAL DISTIL-WHISPER V3.5
+# Total: ~196,000 hours raw → ~98,000 hours after WER filtering
+# -----------------------------------------------------------------------------
+datasets:
+  # 1. LibriSpeech (960 hours) - High quality read speech
+  librispeech:
+    enabled: true
+    name: "librispeech_asr"
+    subset: "all"  # train.clean.100 + train.clean.360 + train.other.500
+    split: "train.clean.100+train.clean.360+train.other.500"
+    streaming: true
+    hours: 960
+    text_column: "text"
+
+  # 2. Common Voice (3,000+ hours) - Crowdsourced multilingual
+  common_voice:
+    enabled: true
+    name: "mozilla-foundation/common_voice_17_0"
+    subset: "en"
+    split: "train"
+    streaming: true
+    hours: 3000
+    text_column: "sentence"
+
+  # 3. VoxPopuli (1,800 hours) - European Parliament
+  voxpopuli:
+    enabled: true
+    name: "facebook/voxpopuli"
+    subset: "en"
+    split: "train"
+    streaming: true
+    hours: 1800
+    text_column: "normalized_text"
+
+  # 4. AMI (100 hours) - Meeting recordings
+  ami:
+    enabled: true
+    name: "edinburghcstr/ami"
+    subset: "ihm"  # Individual headset microphone (cleaner)
+    split: "train"
+    streaming: true
+    hours: 100
+    text_column: "text"
+
+  # 5. People's Speech (30,000 hours) - Large diverse dataset
+  peoples_speech:
+    enabled: true
+    name: "MLCommons/peoples_speech"
+    subset: "clean"  # Use clean subset
+    split: "train"
+    streaming: true
+    hours: 30000
+    text_column: "text"
+
+  # 6. TED-LIUM (450 hours) - TED talks
+  tedlium:
+    enabled: true
+    name: "LIUM/tedlium"
+    subset: "release3"
+    split: "train"
+    streaming: true
+    hours: 450
+    text_column: "text"
+
+  # 7. GigaSpeech (10,000 hours) - Large scale English
+  # NOTE: Requires access agreement on HuggingFace
+  gigaspeech:
+    enabled: true
+    name: "speechcolab/gigaspeech"
+    subset: "xl"  # Use XL for maximum data (10k hours)
+    split: "train"
+    streaming: true
+    hours: 10000
+    text_column: "text"
+
+  # 8. YODAS (150,000 hours) - YouTube Open Dataset for ASR
+  # This is the LARGEST dataset - provides bulk of training data
+  yodas:
+    enabled: true
+    name: "espnet/yodas"
+    subset: "en000"  # English subset
+    split: "train"
+    streaming: true
+    hours: 150000
+    text_column: "text"
+
+  # Validation dataset - LibriSpeech test-clean
+  validation:
+    enabled: true
+    name: "librispeech_asr"
+    subset: "clean"
+    split: "test"
+    streaming: false
+    hours: 5
+    text_column: "text"
+
+# -----------------------------------------------------------------------------
+# Training Hyperparameters - 4x H100 NVL (94GB each)
+# Matching official distil-whisper v3.5 methodology
+# -----------------------------------------------------------------------------
+training:
+  # Total training steps - 80k matching official
+  max_steps: 80000
+
+  # Effective batch size = per_device * accumulation * num_gpus
+  # Official v3.5 uses 4096 on 64 H100s
+  # With 4x H100, we maximize: 32 * 8 * 4 = 1024 (closer to official)
+  per_device_train_batch_size: 32
+  gradient_accumulation_steps: 8
+
+  # Number of GPUs
+  num_gpus: 4
+
+  # Learning rate schedule - OFFICIAL USES LINEAR
+  learning_rate: 1.0e-4
+  lr_scheduler_type: "linear"  # Official uses linear, not cosine
+  warmup_steps: 500  # Official uses 500 warmup steps
+
+  # Weight decay for regularization
+  weight_decay: 0.01
+
+  # Gradient clipping
+  max_grad_norm: 1.0
+
+  # Mixed precision training - H100 has excellent bf16 support
+  fp16: false
+  bf16: true
+
+  # Checkpointing (critical for spot instances!)
+  save_steps: 2500
+  save_total_limit: 5
+
+  # Logging
+  logging_steps: 25
+
+  # Evaluation
+  eval_steps: 5000
+  eval_samples: 2000
+
+  # Dataloader settings - multi-GPU optimized
+  dataloader_num_workers: 8
+  dataloader_pin_memory: true
+  dataloader_prefetch_factor: 4
+
+  # Enable gradient checkpointing to save VRAM
+  gradient_checkpointing: true
+
+# -----------------------------------------------------------------------------
+# Distillation Settings - Official Methodology
+# -----------------------------------------------------------------------------
+distillation:
+  # Temperature for knowledge distillation (higher = softer distributions)
+  # Official uses 2.0
+  temperature: 2.0
+
+  # Loss weights (following EXACT official distil-whisper formula)
+  # Official code: loss = 0.8 * ce_loss + kl_weight * kl_loss
+  # Where kl_weight defaults to 1.0
+  # So: loss = 0.8 * CE + 1.0 * KL
+  ce_weight: 0.8    # Weight for cross-entropy loss (hard labels)
+  kl_weight: 1.0    # Weight for KL divergence loss (soft labels) - DEFAULT 1.0
+
+  # Timestamp probability - include timestamp tokens in X% of samples
+  # Official uses 0.2 (20%)
+  timestamp_probability: 0.2
+
+  # Condition on previous probability
+  # Official uses 0.2 (20%)
+  condition_on_prev_probability: 0.2
+
+  # Pseudo-label generation settings
+  pseudo_labels:
+    # WER threshold - official uses 10%
+    # Samples with WER > 10% are discarded (hallucination filter)
+    wer_threshold: 0.10
+
+    # Generate labels in chunks matching Whisper's 30s window
+    chunk_duration_seconds: 30
+
+    # Use VAD to filter silence
+    use_vad: true
+
+    # Return timestamps from teacher
+    return_timestamps: true
+
+    # Maximum label length (matching Whisper)
+    max_label_length: 256
+
+# -----------------------------------------------------------------------------
+# SpecAugment Settings (Data Augmentation)
+# Following official distil-whisper methodology
+# Reference: https://arxiv.org/abs/1904.08779
+# -----------------------------------------------------------------------------
+spec_augment:
+  enabled: true
+  # Frequency masking parameters
+  freq_mask_param: 27  # Max freq channels to mask
+  n_freq_masks: 2      # Number of freq masks
+  # Time masking parameters
+  time_mask_param: 100  # Max time steps to mask
+  n_time_masks: 2       # Number of time masks
+  # Probability of applying augmentation
+  probability: 0.5
+
+# -----------------------------------------------------------------------------
+# HuggingFace Hub Settings
+# -----------------------------------------------------------------------------
+huggingface:
+  username: "${HF_USERNAME}"
+  repo_name: "distil-crisperwhisper-large-v3"
+  push_to_hub: true
+  push_every_n_steps: 2500
+  private: true
+
+# -----------------------------------------------------------------------------
+# Spot Instance / Preemption Handling
+# -----------------------------------------------------------------------------
+spot_instance:
+  enabled: true
+  check_interval_seconds: 30
+  save_on_preemption: true
+  auto_resume: true
+
+# -----------------------------------------------------------------------------
+# Logging & Monitoring
+# -----------------------------------------------------------------------------
+logging:
+  use_wandb: true
+  wandb_project: "distil-crisperwhisper"
+  wandb_run_name: "all-in-4xH100-official-methodology"
+  use_tensorboard: true
+  tensorboard_dir: "/workspace/tensorboard"
+
+# -----------------------------------------------------------------------------
+# Multi-GPU Settings (Accelerate / DeepSpeed)
+# -----------------------------------------------------------------------------
+multi_gpu:
+  # Use accelerate for distributed training
+  use_accelerate: true
+
+  # Mixed precision backend
+  mixed_precision: "bf16"
+
+  # Optional: DeepSpeed ZeRO for even larger batches
+  # Set to null to disable DeepSpeed
+  deepspeed_config: null
+
+  # NCCL settings for multi-GPU communication
+  nccl_debug: false
+
+# -----------------------------------------------------------------------------
+# CTranslate2 Conversion Settings
+# -----------------------------------------------------------------------------
+conversion:
+  quantization: "float16"
+  output_format: "ctranslate2"
+
+# -----------------------------------------------------------------------------
+# Storage Estimation (for reference)
+# -----------------------------------------------------------------------------
+# NOTE: Full 196,000 hours at 16kHz mono 16-bit = ~4TB
+# With 800GB storage, you can process approximately:
+# - All LibriSpeech (960 hrs) ~50GB
+# - All Common Voice EN (3000 hrs) ~150GB
+# - All VoxPopuli EN (1800 hrs) ~100GB
+# - Subset of GigaSpeech (2000 hrs) ~100GB
+# - Subset of YODAS (30000 hrs) ~400GB (streaming, not cached)
+# Total processable: ~40,000 hours = very good results!
+#
+# For FULL 196k hours: Need 4TB+ storage
+# -----------------------------------------------------------------------------
