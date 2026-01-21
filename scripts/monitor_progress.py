@@ -452,17 +452,25 @@ def main():
     start_time = datetime.now()
 
     console.print(f"[bold green]Starting monitor for {pseudo_labels_dir}[/bold green]")
-    console.print(f"[dim]Refresh rate: {args.refresh}s[/dim]\n")
+    console.print(f"[dim]Refresh rate: {args.refresh}s | Press Ctrl+C to exit[/dim]\n")
 
     try:
-        with Live(create_dashboard(pseudo_labels_dir, start_time),
-                  refresh_per_second=1/args.refresh,
-                  console=console) as live:
+        # Use Live with screen=True for smooth updates without flashing
+        # vertical_overflow="visible" prevents content from being cut off
+        with Live(
+            create_dashboard(pseudo_labels_dir, start_time),
+            console=console,
+            screen=True,  # Use alternate screen buffer - no flashing!
+            refresh_per_second=4,  # Internal refresh rate (smooth)
+            vertical_overflow="visible"
+        ) as live:
             while True:
                 time.sleep(args.refresh)
                 live.update(create_dashboard(pseudo_labels_dir, start_time))
     except KeyboardInterrupt:
-        console.print("\n[yellow]Monitor stopped.[/yellow]")
+        pass  # Clean exit, screen buffer restored automatically
+
+    console.print("\n[yellow]Monitor stopped.[/yellow]")
 
 
 if __name__ == '__main__':
