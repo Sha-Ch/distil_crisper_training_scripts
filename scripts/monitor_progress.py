@@ -50,12 +50,13 @@ console = Console()
 
 # Estimated samples per dataset (based on ~120 samples per hour of audio)
 # These are approximations - actual counts vary by dataset
+# Updated based on actual observed counts from processing
 DATASET_ESTIMATES = {
     # CrisperWhisper filler datasets (highest priority)
-    'ami': {'hours': 100, 'samples': 29000},  # ~29k meeting clips with fillers
+    'ami': {'hours': 100, 'samples': 110000},  # ~110k meeting clips (IHM has many short segments)
     'podcast_fillers': {'hours': 145, 'samples': 105000},  # 35k fillers expanded to 105k
     # Distil-Whisper v3.5 datasets
-    'librispeech': {'hours': 960, 'samples': 280000},
+    'librispeech': {'hours': 960, 'samples': 115200},  # ~115k samples (all splits combined)
     'gigaspeech': {'hours': 10000, 'samples': 3000000},
     'voxpopuli': {'hours': 1800, 'samples': 540000},
     'common_voice': {'hours': 3000, 'samples': 1800000},
@@ -234,7 +235,11 @@ def make_progress_bar(current, total, width=20):
 
 
 def create_dataset_table(file_stats, progress_data):
-    """Create a table showing per-dataset progress with progress bars."""
+    """Create a table showing per-dataset progress with progress bars.
+
+    IMPORTANT: We use file_stats (from actual JSONL files) as the source of truth
+    for sample counts, NOT progress_data (which only tracks GPU 0's view).
+    """
     table = Table(
         title="[bold cyan]Dataset Progress[/bold cyan]",
         box=box.ROUNDED,
@@ -263,10 +268,12 @@ def create_dataset_table(file_stats, progress_data):
     current_dataset = None
 
     for name in dataset_order:
+        # Use file_stats as source of truth (actual JSONL file contents)
         stats = file_stats.get(name, {'accepted': 0, 'rejected': 0, 'hours': 0, 'wer_sum': 0})
         ds_info = datasets_info.get(name, {})
         estimates = DATASET_ESTIMATES.get(name, {'samples': 0})
 
+        # Get counts from actual files (not progress tracker which only has GPU 0 stats)
         accepted = stats['accepted']
         rejected = stats['rejected']
         hours = stats['hours']

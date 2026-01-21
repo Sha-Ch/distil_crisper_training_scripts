@@ -762,6 +762,10 @@ class MultiGPUPseudoLabelGenerator:
         """
         Save processing progress.
 
+        NOTE: This saves GPU 0's view of progress. For accurate total counts,
+        use _load_processed_ids_from_files() which scans all GPU output files.
+        The monitor uses file-based counting for accuracy.
+
         Includes GPU count for diagnostics when resuming with different config.
         """
         data = {
