@@ -51,6 +51,10 @@ console = Console()
 # Estimated samples per dataset (based on ~120 samples per hour of audio)
 # These are approximations - actual counts vary by dataset
 DATASET_ESTIMATES = {
+    # CrisperWhisper filler datasets (highest priority)
+    'ami_verbatim': {'hours': 100, 'samples': 29000},  # ~29k meeting clips
+    'podcast_fillers': {'hours': 145, 'samples': 105000},  # 35k fillers expanded to 105k
+    # Distil-Whisper v3.5 datasets
     'librispeech': {'hours': 960, 'samples': 280000},
     'gigaspeech': {'hours': 10000, 'samples': 3000000},
     'voxpopuli': {'hours': 1800, 'samples': 540000},
@@ -247,9 +251,9 @@ def create_dataset_table(file_stats, progress_data):
     table.add_column("WER", justify="right", width=5)
     table.add_column("Status", justify="center", width=9)
 
-    # Dataset order by priority
-    dataset_order = ['librispeech', 'gigaspeech', 'voxpopuli', 'common_voice',
-                     'tedlium', 'ami', 'peoples_speech', 'yodas']
+    # Dataset order by priority (filler datasets first)
+    dataset_order = ['ami_verbatim', 'podcast_fillers', 'librispeech', 'gigaspeech',
+                     'voxpopuli', 'common_voice', 'tedlium', 'ami', 'peoples_speech', 'yodas']
 
     total_processed = 0
     total_estimated = 0
