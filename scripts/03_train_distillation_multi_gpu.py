@@ -841,7 +841,7 @@ class DistillationTrainer:
                 with self.accelerator.accumulate(self.student_model):
                     # Apply SpecAugment to input features
                     input_features = batch['input_features']
-                    if self.training:
+                    if self.student_model.training:
                         input_features = self.spec_augment(input_features)
 
                     # Student forward pass

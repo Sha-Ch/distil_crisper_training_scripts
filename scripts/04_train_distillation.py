@@ -323,14 +323,14 @@ def create_student_model(
     if num_decoder_layers == 1:
         layer_indices = [teacher_decoder_layers - 1]  # Last layer
     else:
-        layer_indices = np.linspace(0, teacher_decoder_layers - 1, num_decoder_layers, dtype=int)
+        layer_indices = np.linspace(0, teacher_decoder_layers - 1, num_decoder_layers, dtype=int).tolist()
 
     for student_idx, teacher_idx in enumerate(layer_indices):
         student_model.model.decoder.layers[student_idx].load_state_dict(
             teacher_model.model.decoder.layers[teacher_idx].state_dict()
         )
 
-    console.print(f"  ✓ Decoder layers copied from teacher indices: {layer_indices.tolist()}")
+    console.print(f"  ✓ Decoder layers copied from teacher indices: {layer_indices}")
 
     # 3. Copy decoder embeddings
     student_model.model.decoder.embed_tokens.load_state_dict(
@@ -635,7 +635,8 @@ class DistillationTrainer:
         distil_config = self.config['distillation']
         self.loss_fn = DistillationLoss(
             temperature=distil_config['temperature'],
-            alpha=distil_config['alpha']
+            ce_weight=distil_config.get('ce_weight', 0.8),
+            kl_weight=distil_config.get('kl_weight', 1.0)
         )
 
         console.print("[green]✓ Training setup complete[/green]")
@@ -791,7 +792,7 @@ class DistillationTrainer:
                     with self.accelerator.accumulate(self.student_model):
                         # Apply SpecAugment to input features
                         input_features = batch['input_features']
-                        if self.training:
+                        if self.student_model.training:
                             input_features = self.spec_augment(input_features)
 
                         # Forward pass through student

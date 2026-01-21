@@ -1030,7 +1030,7 @@ def main():
     if is_main:
         merged_path, stats = generator.merge_all_outputs()
 
-        console.print("\n[bold green]{'═' * 60}[/bold green]")
+        console.print(f"\n[bold green]{'═' * 60}[/bold green]")
         console.print("[bold green]  Pseudo-Label Generation Complete![/bold green]")
         console.print(f"[bold green]{'═' * 60}[/bold green]")
         console.print(f"\nTotal accepted samples: [green]{stats['total_count']:,}[/green]")
