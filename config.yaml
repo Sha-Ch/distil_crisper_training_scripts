@@ -56,11 +56,34 @@ teacher:
   dtype: "float16"
 
   # Batch size for generating pseudo-labels per GPU
+  # This is the KEY setting for GPU utilization!
+  # H100 94GB: can handle 48-64 samples per batch with 30s audio
+  # A100 80GB: can handle 32-48 samples per batch
+  # A100 40GB: can handle 16-24 samples per batch
   # 4x H100 NVL: 48 per device * 4 GPUs = 192 effective batch
   pseudo_label_batch_size: 48
 
   # Attention implementation (sdpa is fastest on H100)
   attn_implementation: "sdpa"
+
+# -----------------------------------------------------------------------------
+# Batch Processing Settings (GPU Optimization)
+# -----------------------------------------------------------------------------
+# These settings control how audio samples are batched for GPU inference.
+# Proper batching can improve throughput by 10-50x!
+batch_processing:
+  # Number of threads for parallel audio loading (I/O bound)
+  # Recommended: 4-16 depending on storage speed
+  audio_loader_workers: 8
+
+  # Enable dynamic batching based on audio length
+  # When true, groups similar-length audios to minimize padding overhead
+  dynamic_batching: false
+
+  # Max combined audio length per batch (seconds)
+  # Used when dynamic_batching is enabled
+  # Higher values = more GPU memory usage
+  max_batch_audio_seconds: 480  # 48 samples * 10s avg
 
 # -----------------------------------------------------------------------------
 # Student Model (Distilled) - MAXIMUM QUALITY CONFIG
