@@ -368,6 +368,14 @@ class PseudoLabelReprocessor:
             for entry in entries:
                 f.write(json.dumps(entry) + '\n')
 
+    def _extract_gpu_number(self, filepath: Path) -> int:
+        """Extract GPU number from filename like 'dataset_gpu3_accepted.jsonl' -> 3."""
+        import re
+        match = re.search(r'_gpu(\d+)_', filepath.name)
+        if match:
+            return int(match.group(1))
+        return 0
+
     def process_dataset(self, name: str, files: Dict[str, List[Path]]) -> Dict[str, int]:
         """
         Process all files for a single dataset using multiprocessing.
@@ -382,56 +390,67 @@ class PseudoLabelReprocessor:
         self.stats.add_dataset(name)
         dataset_stats = self.stats.dataset_stats[name]
 
-        # Load all entries from accepted files
-        accepted_entries = []
+        # Load all entries from accepted files, tracking source GPU
+        # Format: (entry_dict, was_accepted, source_gpu)
+        all_entries = []
+
         for filepath in files['accepted']:
+            gpu_num = self._extract_gpu_number(filepath)
             entries = self._load_jsonl_file(filepath)
             for entry in entries:
-                accepted_entries.append((entry, True))
+                all_entries.append((entry, True, gpu_num))
 
-        # Load all entries from rejected files
-        rejected_entries = []
+        accepted_count = len(all_entries)
+
         for filepath in files['rejected']:
+            gpu_num = self._extract_gpu_number(filepath)
             entries = self._load_jsonl_file(filepath)
             for entry in entries:
-                rejected_entries.append((entry, False))
+                all_entries.append((entry, False, gpu_num))
 
-        all_entries = accepted_entries + rejected_entries
+        rejected_count = len(all_entries) - accepted_count
         total_entries = len(all_entries)
 
         if total_entries == 0:
             console.print(f"[yellow]No entries found for {name}[/yellow]")
             return dataset_stats
 
-        console.print(f"\n[bold]Processing {name}:[/bold] {total_entries:,} entries ({len(accepted_entries):,} accepted, {len(rejected_entries):,} rejected)")
+        console.print(f"\n[bold]Processing {name}:[/bold] {total_entries:,} entries ({accepted_count:,} accepted, {rejected_count:,} rejected)")
 
         # Prepare args for multiprocessing (entry_dict, was_accepted, wer_threshold)
+        # We'll track gpu_num separately
         process_args = [
             (entry_dict, was_accepted, self.wer_threshold)
-            for entry_dict, was_accepted in all_entries
+            for entry_dict, was_accepted, gpu_num in all_entries
         ]
+        gpu_nums = [gpu_num for entry_dict, was_accepted, gpu_num in all_entries]
 
         # Process using multiprocessing with progress bar
-        new_accepted = []
-        new_rejected = []
+        # Results: dict mapping gpu_num -> {'accepted': [], 'rejected': []}
+        results_by_gpu = {}
 
         # Process in chunks to avoid memory issues with large datasets
         chunk_size = 10000
 
+        # We need to track the index to correlate results with gpu_nums
+        result_entries = [None] * total_entries
+
         with tqdm(total=total_entries, desc=f"  Reprocessing {name}", unit="samples") as pbar:
             for chunk_start in range(0, len(process_args), chunk_size):
-                chunk_args = process_args[chunk_start:chunk_start + chunk_size]
+                chunk_end = min(chunk_start + chunk_size, len(process_args))
+                chunk_args = process_args[chunk_start:chunk_end]
+                chunk_indices = list(range(chunk_start, chunk_end))
 
                 with ProcessPoolExecutor(max_workers=self.num_workers) as executor:
-                    # Submit chunk of tasks
+                    # Submit chunk of tasks with their indices
                     futures = {
-                        executor.submit(process_single_entry, args): args
-                        for args in chunk_args
+                        executor.submit(process_single_entry, args): (idx, args)
+                        for idx, args in zip(chunk_indices, chunk_args)
                     }
 
                     # Process results
                     for future in as_completed(futures):
-                        original_args = futures[future]
+                        idx, original_args = futures[future]
                         original_entry, was_accepted, _ = original_args
 
                         try:
@@ -441,32 +460,35 @@ class PseudoLabelReprocessor:
 
                             if status == 'accepted_to_rejected':
                                 dataset_stats['accepted_to_rejected'] += 1
-                                new_rejected.append(entry_dict)
+                                result_entries[idx] = (entry_dict, False)  # Now rejected
                             elif status == 'rejected_to_accepted':
                                 dataset_stats['rejected_to_accepted'] += 1
-                                new_accepted.append(entry_dict)
+                                result_entries[idx] = (entry_dict, True)  # Now accepted
                             elif status == 'unchanged_accepted':
                                 dataset_stats['unchanged_accepted'] += 1
-                                new_accepted.append(entry_dict)
+                                result_entries[idx] = (entry_dict, True)
                             elif status == 'unchanged_rejected':
                                 dataset_stats['unchanged_rejected'] += 1
-                                new_rejected.append(entry_dict)
+                                result_entries[idx] = (entry_dict, False)
                             else:  # error
                                 dataset_stats['errors'] += 1
-                                # Keep in original location on error
-                                if was_accepted:
-                                    new_accepted.append(entry_dict)
-                                else:
-                                    new_rejected.append(entry_dict)
+                                result_entries[idx] = (entry_dict, was_accepted)
                         except Exception as e:
                             dataset_stats['errors'] += 1
-                            # On exception, keep original entry in original location
-                            if was_accepted:
-                                new_accepted.append(original_entry)
-                            else:
-                                new_rejected.append(original_entry)
+                            result_entries[idx] = (original_entry, was_accepted)
 
                         pbar.update(1)
+
+        # Group results by GPU number
+        for idx, (entry_dict, is_accepted) in enumerate(result_entries):
+            gpu_num = gpu_nums[idx]
+            if gpu_num not in results_by_gpu:
+                results_by_gpu[gpu_num] = {'accepted': [], 'rejected': []}
+
+            if is_accepted:
+                results_by_gpu[gpu_num]['accepted'].append(entry_dict)
+            else:
+                results_by_gpu[gpu_num]['rejected'].append(entry_dict)
 
         # Update global stats
         self.stats.total_processed += dataset_stats['total']
@@ -486,33 +508,47 @@ class PseudoLabelReprocessor:
             console.print(f"  [yellow]DRY RUN - No changes written[/yellow]")
             return dataset_stats
 
-        # Write new files
-        # First, backup original files
+        # Backup original files first
         if self.backup:
             for filepath in files['accepted'] + files['rejected']:
                 backup_path = filepath.with_suffix('.jsonl.backup')
                 if not backup_path.exists():
                     shutil.copy2(filepath, backup_path)
 
-        # Write consolidated output files
+        # Write output files
         if self.replace_originals:
-            # Delete original GPU files and write to gpu0 format
+            # Delete original GPU files
             for filepath in files['accepted'] + files['rejected']:
                 if filepath.exists():
                     filepath.unlink()
                     console.print(f"  [dim]Deleted {filepath.name}[/dim]")
 
-            output_accepted = self.input_dir / f'{name}_gpu0_accepted.jsonl'
-            output_rejected = self.input_dir / f'{name}_gpu0_rejected.jsonl'
+            # Write back to same GPU files
+            for gpu_num, gpu_results in sorted(results_by_gpu.items()):
+                accepted_file = self.input_dir / f'{name}_gpu{gpu_num}_accepted.jsonl'
+                rejected_file = self.input_dir / f'{name}_gpu{gpu_num}_rejected.jsonl'
+
+                self._write_jsonl_file(accepted_file, gpu_results['accepted'])
+                console.print(f"  [green]Wrote {len(gpu_results['accepted']):,} accepted to {accepted_file.name}[/green]")
+
+                self._write_jsonl_file(rejected_file, gpu_results['rejected'])
+                console.print(f"  [yellow]Wrote {len(gpu_results['rejected']):,} rejected to {rejected_file.name}[/yellow]")
         else:
+            # Write to reprocessed files (consolidated)
+            all_accepted = []
+            all_rejected = []
+            for gpu_results in results_by_gpu.values():
+                all_accepted.extend(gpu_results['accepted'])
+                all_rejected.extend(gpu_results['rejected'])
+
             output_accepted = self.input_dir / f'{name}_reprocessed_accepted.jsonl'
             output_rejected = self.input_dir / f'{name}_reprocessed_rejected.jsonl'
 
-        self._write_jsonl_file(output_accepted, new_accepted)
-        console.print(f"  [green]Wrote {len(new_accepted):,} accepted samples to {output_accepted.name}[/green]")
+            self._write_jsonl_file(output_accepted, all_accepted)
+            console.print(f"  [green]Wrote {len(all_accepted):,} accepted samples to {output_accepted.name}[/green]")
 
-        self._write_jsonl_file(output_rejected, new_rejected)
-        console.print(f"  [yellow]Wrote {len(new_rejected):,} rejected samples to {output_rejected.name}[/yellow]")
+            self._write_jsonl_file(output_rejected, all_rejected)
+            console.print(f"  [yellow]Wrote {len(all_rejected):,} rejected samples to {output_rejected.name}[/yellow]")
 
         return dataset_stats
 
