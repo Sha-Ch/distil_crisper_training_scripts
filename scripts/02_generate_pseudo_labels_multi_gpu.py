@@ -2847,25 +2847,30 @@ class MultiGPUPseudoLabelGenerator:
 
                 if not batch_data:
                     # No more data
+                    should_exit = False
                     if prefetcher.is_exhausted():
                         if self.is_main:
                             console.print(f"[green]Dataset {name} exhausted - all samples processed[/green]")
-                        break
+                        should_exit = True
 
                     # Track consecutive empty batches
-                    empty_batch_count += 1
+                    if not should_exit:
+                        empty_batch_count += 1
 
-                    # Safety: If we've gotten 10+ empty batches in a row and feeder is done,
-                    # the workers may have all finished but exhausted flag not set due to race
-                    if empty_batch_count >= 10 and prefetcher.feeder_done.is_set():
-                        if self.is_main:
-                            console.print(f"[yellow]Warning: {empty_batch_count} empty batches, feeder done - checking exhaustion[/yellow]")
-                        # Give workers a moment to finish and set exhausted flag
-                        time.sleep(2.0)
-                        if prefetcher.is_exhausted() or (prefetcher.processed_queue.empty() and prefetcher.raw_queue.empty()):
+                        # Safety: If we've gotten 10+ empty batches in a row and feeder is done,
+                        # the workers may have all finished but exhausted flag not set due to race
+                        if empty_batch_count >= 10 and prefetcher.feeder_done.is_set():
                             if self.is_main:
-                                console.print(f"[green]Dataset {name} processing complete (detected via empty queues)[/green]")
-                            break
+                                console.print(f"[yellow]Warning: {empty_batch_count} empty batches, feeder done - checking exhaustion[/yellow]")
+                            # Give workers a moment to finish and set exhausted flag
+                            time.sleep(2.0)
+                            if prefetcher.is_exhausted() or (prefetcher.processed_queue.empty() and prefetcher.raw_queue.empty()):
+                                if self.is_main:
+                                    console.print(f"[green]Dataset {name} processing complete (detected via empty queues)[/green]")
+                                should_exit = True
+
+                    if should_exit:
+                        break
 
                     # Prevent busy loop - small sleep when no data
                     time.sleep(0.1)
@@ -2964,6 +2969,64 @@ class MultiGPUPseudoLabelGenerator:
 
             if pbar:
                 pbar.close()
+
+        # COORDINATED SHUTDOWN: Synchronize all GPUs after processing loop
+        # This is CRITICAL to prevent NCCL timeouts. When GPUs finish at different
+        # times (due to uneven data distribution from deduplication/sharding), we
+        # need to ensure all GPUs have exited the processing loop before proceeding.
+        #
+        # We use FILE-BASED signaling instead of NCCL collectives because:
+        # 1. NCCL collectives (barrier, all_reduce) block until ALL GPUs call them
+        # 2. If one GPU is stuck in processing loop, others will timeout at the collective
+        # 3. File-based signaling is non-blocking and allows timeout-based polling
+        if self.is_distributed:
+            try:
+                # Signal this GPU is done by creating a marker file
+                done_marker = self.pseudo_labels_dir / f'{name}_gpu{self.local_rank}_done.marker'
+                done_marker.touch()
+                console.print(f"[cyan]GPU {self.local_rank}: Processing complete, waiting for other GPUs...[/cyan]")
+
+                # Wait for all GPUs to create their marker files (with timeout)
+                max_wait_seconds = 300  # 5 minute timeout (less than NCCL's 10 min default)
+                poll_interval = 2.0
+                waited = 0
+
+                while waited < max_wait_seconds:
+                    # Check if all GPUs have finished
+                    all_done = True
+                    for gpu_id in range(self.world_size):
+                        marker = self.pseudo_labels_dir / f'{name}_gpu{gpu_id}_done.marker'
+                        if not marker.exists():
+                            all_done = False
+                            break
+
+                    if all_done:
+                        if self.is_main:
+                            console.print(f"[green]All {self.world_size} GPUs completed processing[/green]")
+                        break
+
+                    time.sleep(poll_interval)
+                    waited += poll_interval
+
+                    # Periodic status update
+                    if waited % 30 == 0 and self.is_main:
+                        done_count = sum(1 for gpu_id in range(self.world_size)
+                                        if (self.pseudo_labels_dir / f'{name}_gpu{gpu_id}_done.marker').exists())
+                        console.print(f"[yellow]Waiting for GPUs: {done_count}/{self.world_size} done ({waited:.0f}s elapsed)[/yellow]")
+
+                if waited >= max_wait_seconds:
+                    # Timeout - some GPUs may be stuck
+                    done_gpus = [gpu_id for gpu_id in range(self.world_size)
+                                if (self.pseudo_labels_dir / f'{name}_gpu{gpu_id}_done.marker').exists()]
+                    missing_gpus = [gpu_id for gpu_id in range(self.world_size) if gpu_id not in done_gpus]
+                    console.print(f"[red]GPU {self.local_rank}: Timeout waiting for GPUs {missing_gpus}[/red]")
+                    console.print(f"[yellow]Proceeding with available results...[/yellow]")
+
+                # Clean up marker files (main process only, after barrier)
+                # Don't clean up yet - let the final barrier in process_all_datasets handle sync
+
+            except Exception as e:
+                console.print(f"[yellow]GPU {self.local_rank}: Coordination warning: {e}[/yellow]")
 
         # Get final stats from prefetcher
         prefetch_stats = prefetcher.get_stats()
@@ -3125,9 +3188,24 @@ class MultiGPUPseudoLabelGenerator:
                 console.print(f"    Accepted hours: [green]{progress.accepted_duration_hours:.1f}[/green]")
                 console.print(f"    Avg WER: {progress.avg_wer * 100:.1f}%")
 
-            # Synchronize between datasets
+            # Synchronize between datasets using NCCL barrier
+            # This is now SAFE because we already coordinated via file markers in _process_dataset_standard
+            # All GPUs should reach this point within a reasonable time
             if self.is_distributed:
-                dist.barrier()
+                try:
+                    dist.barrier()
+                except Exception as e:
+                    console.print(f"[yellow]GPU {self.local_rank}: Barrier warning: {e}[/yellow]")
+
+                # Clean up marker files after successful sync (main process only)
+                if self.is_main:
+                    for gpu_id in range(self.world_size):
+                        marker = self.pseudo_labels_dir / f'{name}_gpu{gpu_id}_done.marker'
+                        try:
+                            if marker.exists():
+                                marker.unlink()
+                        except Exception:
+                            pass
 
             # Clear GPU cache
             if torch.cuda.is_available():
