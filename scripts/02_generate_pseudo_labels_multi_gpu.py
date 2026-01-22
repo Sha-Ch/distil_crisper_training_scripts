@@ -1989,9 +1989,33 @@ class MultiGPUPseudoLabelGenerator:
 
         all_progress = {}
 
+        # Load existing progress to check for completed datasets
+        saved_progress = self._load_progress()
+
         for name in dataset_names:
             if self.spot_handler.should_stop:
                 break
+
+            # SKIP ALREADY COMPLETED DATASETS
+            # This prevents re-iterating through completed datasets on resume
+            if resume and name in saved_progress:
+                existing = saved_progress[name]
+                if isinstance(existing, dict):
+                    status = existing.get('status', 'pending')
+                else:
+                    status = getattr(existing, 'status', 'pending')
+
+                if status == 'completed':
+                    if self.is_main:
+                        console.print(f"\n[bold green]{'═' * 50}[/bold green]")
+                        console.print(f"[bold green]  Skipping {name} (already completed)[/bold green]")
+                        console.print(f"[bold green]{'═' * 50}[/bold green]")
+                    # Restore progress for summary
+                    if isinstance(existing, dict):
+                        all_progress[name] = DatasetProgress(**existing)
+                    else:
+                        all_progress[name] = existing
+                    continue
 
             if self.is_main:
                 console.print(f"\n[bold cyan]{'═' * 50}[/bold cyan]")
