@@ -48,37 +48,45 @@ except ImportError:
 
 console = Console()
 
-# Estimated samples per dataset
-# NOTE: These are ESTIMATES for progress bars only - actual counts come from JSONL files
-# Updated based on official dataset documentation and observed processing
+# Dataset sample counts - RESEARCHED ACTUAL values from HuggingFace documentation
+# Sources:
+# - LibriSpeech: https://huggingface.co/datasets/openslr/librispeech_asr
+# - AMI: https://huggingface.co/datasets/edinburghcstr/ami
+# - TED-LIUM: https://www.tensorflow.org/datasets/catalog/tedlium (release3)
+# - PodcastFillers: https://huggingface.co/datasets/ylacombe/podcast_fillers_by_license
+# - GigaSpeech: https://huggingface.co/datasets/speechcolab/gigaspeech
+# - VoxPopuli: https://huggingface.co/datasets/facebook/voxpopuli
+#
+# The processing script will also create {dataset}_metadata.json with exact counts
+# when downloading - those override these values if present.
 DATASET_ESTIMATES = {
-    # CrisperWhisper filler datasets (highest priority)
-    # AMI IHM: ~100 hours, but segmented into short clips (~29k samples based on official docs)
-    'ami': {'hours': 100, 'samples': 76000},  # AMI corpus IHM split
-    # PodcastFillers: ~35k filler instances (not 105k - that's after augmentation)
-    'podcast_fillers': {'hours': 145, 'samples': 105600},  # 145 hours * 120 samples/hr * 6x expansion
+    # VERIFIED from HuggingFace documentation:
+    # LibriSpeech: train.clean.100 (28,539) + train.clean.360 (104,014) + train.other.500 (148,688)
+    'librispeech': {'hours': 960, 'samples': 281241},
 
-    # Distil-Whisper v3.5 datasets - estimates based on ~120 samples/hour average
-    # LibriSpeech: train.clean.100 + train.clean.360 + train.other.500 = 960 hours
-    # Official counts: ~28.5k + ~104k + ~148k = ~281k samples
-    'librispeech': {'hours': 960, 'samples': 115200},  # Conservative: 960 * 120
+    # AMI IHM: 108,502 samples (from dataset card example output)
+    'ami': {'hours': 100, 'samples': 108502},
 
-    # GigaSpeech XL: 10,000 hours, variable segment lengths
-    'gigaspeech': {'hours': 10000, 'samples': 3000000},  # ~300 samples/hr for podcasts
+    # TED-LIUM release3: 268,263 samples (from TensorFlow Datasets catalog)
+    'tedlium': {'hours': 450, 'samples': 268263},
 
-    # VoxPopuli EN: 1,800 hours European Parliament
-    'voxpopuli': {'hours': 1800, 'samples': 540000},  # 1800 * 300 (longer segments)
+    # PodcastFillers: 199 full episodes split by license (CC_BY_3.0: 100, CC_BY_SA_3.0: 79, CC_BY_ND_3.0: 20)
+    # Note: These are full episodes, not individual filler instances
+    'podcast_fillers': {'hours': 145, 'samples': 199},
 
-    # Common Voice 17: ~3,000 hours crowdsourced
-    'common_voice': {'hours': 3000, 'samples': 1800000},  # Short clips ~600 samples/hr
+    # GigaSpeech XL: 10,000 hours - exact sample count not in docs, estimate ~2.5M
+    # XS has 9,389 samples for 10 hours, so XL (10,000h) would be ~1000x = ~2.5-3M
+    'gigaspeech': {'hours': 10000, 'samples': 2500000},
 
-    # TED-LIUM release3: ~450 hours
-    'tedlium': {'hours': 450, 'samples': 100000},  # Longer TED talk segments
+    # VoxPopuli EN: 543 hours transcribed, ~182k samples estimated
+    # (exact count requires loading dataset)
+    'voxpopuli': {'hours': 543, 'samples': 182000},
 
-    # People's Speech: 30,000 hours (clean subset)
+    # Common Voice 17 EN: requires Mozilla Data Collective access, estimate ~1.2M
+    'common_voice': {'hours': 3000, 'samples': 1200000},
+
+    # Streaming only - large estimates:
     'peoples_speech': {'hours': 30000, 'samples': 9000000},
-
-    # YODAS: 150,000 hours YouTube
     'yodas': {'hours': 150000, 'samples': 50000000},
 }
 
@@ -132,12 +140,14 @@ def load_actual_sample_counts(pseudo_labels_dir: Path) -> dict:
     """
     Load ACTUAL sample counts from metadata files created by processing script.
 
-    The processing script saves the real count when downloading datasets.
-    These are EXACT counts, not estimates.
+    The processing script saves {dataset}_metadata.json with exact counts when downloading.
     """
     actual_counts = {}
 
-    for metadata_file in pseudo_labels_dir.glob('*_metadata.json'):
+    # Look for all metadata files
+    metadata_files = list(pseudo_labels_dir.glob('*_metadata.json'))
+
+    for metadata_file in metadata_files:
         try:
             with open(metadata_file, 'r') as f:
                 metadata = json.load(f)
