@@ -294,6 +294,7 @@ class PseudoLabelReprocessor:
         num_workers: int = None,
         dry_run: bool = False,
         backup: bool = True,
+        replace_originals: bool = False,
     ):
         """
         Args:
@@ -302,12 +303,14 @@ class PseudoLabelReprocessor:
             num_workers: Number of worker processes (default: CPU count)
             dry_run: If True, don't write changes, just report what would happen
             backup: If True, create .backup files before modifying
+            replace_originals: If True, delete original GPU files and rename reprocessed to gpu0 format
         """
         self.input_dir = Path(input_dir)
         self.wer_threshold = wer_threshold
         self.num_workers = num_workers or cpu_count()
         self.dry_run = dry_run
         self.backup = backup
+        self.replace_originals = replace_originals
 
         # Stats
         self.stats = ReprocessStats()
@@ -320,14 +323,15 @@ class PseudoLabelReprocessor:
         """
         Find all accepted and rejected JSONL files grouped by dataset.
 
+        Only looks for GPU format: {dataset}_gpu{N}_accepted.jsonl
+
         Returns:
             Dict mapping dataset name -> {'accepted': [paths], 'rejected': [paths]}
         """
         datasets = {}
 
-        # Find all JSONL files
+        # Find GPU format files: {dataset}_gpu{N}_accepted.jsonl
         for filepath in self.input_dir.glob('*_gpu*_accepted.jsonl'):
-            # Extract dataset name (everything before _gpu)
             name = filepath.name.rsplit('_gpu', 1)[0]
             if name not in datasets:
                 datasets[name] = {'accepted': [], 'rejected': []}
@@ -491,8 +495,18 @@ class PseudoLabelReprocessor:
                     shutil.copy2(filepath, backup_path)
 
         # Write consolidated output files
-        output_accepted = self.input_dir / f'{name}_reprocessed_accepted.jsonl'
-        output_rejected = self.input_dir / f'{name}_reprocessed_rejected.jsonl'
+        if self.replace_originals:
+            # Delete original GPU files and write to gpu0 format
+            for filepath in files['accepted'] + files['rejected']:
+                if filepath.exists():
+                    filepath.unlink()
+                    console.print(f"  [dim]Deleted {filepath.name}[/dim]")
+
+            output_accepted = self.input_dir / f'{name}_gpu0_accepted.jsonl'
+            output_rejected = self.input_dir / f'{name}_gpu0_rejected.jsonl'
+        else:
+            output_accepted = self.input_dir / f'{name}_reprocessed_accepted.jsonl'
+            output_rejected = self.input_dir / f'{name}_reprocessed_rejected.jsonl'
 
         self._write_jsonl_file(output_accepted, new_accepted)
         console.print(f"  [green]Wrote {len(new_accepted):,} accepted samples to {output_accepted.name}[/green]")
@@ -510,7 +524,8 @@ class PseudoLabelReprocessor:
             f"WER Threshold: {self.wer_threshold * 100:.0f}%\n"
             f"Worker Processes: {self.num_workers} (TRUE parallel)\n"
             f"Dry Run: {self.dry_run}\n"
-            f"Backup: {self.backup}",
+            f"Backup: {self.backup}\n"
+            f"Replace Originals: {self.replace_originals}",
             title="Configuration"
         ))
 
@@ -581,6 +596,9 @@ Examples:
 
   # Skip backup creation
   python 04_reprocess_pseudo_labels.py --input-dir ./pseudo_labels --no-backup
+
+  # Replace original GPU files with reprocessed (deletes old, writes to gpu0 format)
+  python 04_reprocess_pseudo_labels.py --input-dir ./pseudo_labels --replace-originals
         """
     )
 
@@ -617,6 +635,12 @@ Examples:
         help='Skip creating backup files'
     )
 
+    parser.add_argument(
+        '--replace-originals', '-r',
+        action='store_true',
+        help='Delete original GPU files and write reprocessed to gpu0 format (for compatibility)'
+    )
+
     args = parser.parse_args()
 
     try:
@@ -626,6 +650,7 @@ Examples:
             num_workers=args.workers,
             dry_run=args.dry_run,
             backup=not args.no_backup,
+            replace_originals=args.replace_originals,
         )
         reprocessor.run()
 
