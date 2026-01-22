@@ -71,8 +71,12 @@ from rich.panel import Panel
 # Official Whisper text normalizer (matches distil-whisper methodology)
 from transformers.models.whisper.english_normalizer import EnglishTextNormalizer
 
-# Suppress warnings
+# Suppress warnings - especially the noisy Whisper decoder warnings
 warnings.filterwarnings('ignore')
+# Specifically suppress the forced_decoder_ids and attention_mask warnings from transformers
+import logging
+logging.getLogger("transformers.generation.utils").setLevel(logging.ERROR)
+logging.getLogger("transformers.modeling_utils").setLevel(logging.ERROR)
 
 console = Console()
 
@@ -1803,6 +1807,9 @@ class MultiGPUPseudoLabelGenerator:
             total_batches = 0
 
             # Main processing loop - pull batches from prefetcher
+            empty_batch_count = 0  # Track consecutive empty batches for stuck detection
+            last_progress_time = time.time()
+
             while not self.spot_handler.should_stop:
                 # Get a batch from the prefetcher (blocks until ready or timeout)
                 prefetch_stats_before = prefetcher.get_stats()
@@ -1818,8 +1825,32 @@ class MultiGPUPseudoLabelGenerator:
                 if not batch_data:
                     # No more data
                     if prefetcher.is_exhausted():
+                        if self.is_main:
+                            console.print(f"[green]Dataset {name} exhausted - all samples processed[/green]")
                         break
+
+                    # Track consecutive empty batches
+                    empty_batch_count += 1
+
+                    # Safety: If we've gotten 10+ empty batches in a row and feeder is done,
+                    # the workers may have all finished but exhausted flag not set due to race
+                    if empty_batch_count >= 10 and prefetcher.feeder_done.is_set():
+                        if self.is_main:
+                            console.print(f"[yellow]Warning: {empty_batch_count} empty batches, feeder done - checking exhaustion[/yellow]")
+                        # Give workers a moment to finish and set exhausted flag
+                        time.sleep(2.0)
+                        if prefetcher.is_exhausted() or (prefetcher.processed_queue.empty() and prefetcher.raw_queue.empty()):
+                            if self.is_main:
+                                console.print(f"[green]Dataset {name} processing complete (detected via empty queues)[/green]")
+                            break
+
+                    # Prevent busy loop - small sleep when no data
+                    time.sleep(0.1)
                     continue
+                else:
+                    # Got data, reset empty counter
+                    empty_batch_count = 0
+                    last_progress_time = time.time()
 
                 if max_samples and samples_this_run >= max_samples // self.world_size:
                     break
