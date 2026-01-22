@@ -1138,6 +1138,8 @@ class MultiGPUPseudoLabelGenerator:
                         info['gpu_count_at_start'] = data.get('world_size', 1)
                     if 'processed_sample_ids' not in info:
                         info['processed_sample_ids'] = []
+                    if 'verification_status' not in info:
+                        info['verification_status'] = ''
                     result[name] = DatasetProgress(**info)
                 return result
         return {}
