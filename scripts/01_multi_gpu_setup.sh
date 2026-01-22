@@ -27,7 +27,7 @@ CONFIG_DIR="$(dirname "$SCRIPT_DIR")"
 
 echo -e "${BLUE}╔═══════════════════════════════════════════════════════════════════╗${NC}"
 echo -e "${BLUE}║     Distil-CrisperWhisper: Official Methodology Setup            ║${NC}"
-echo -e "${BLUE}║     4x H100 NVL (376GB VRAM) - All-In Configuration              ║${NC}"
+echo -e "${BLUE}║     7x H200 (987GB VRAM) - All-In Configuration                  ║${NC}"
 echo -e "${BLUE}╚═══════════════════════════════════════════════════════════════════╝${NC}"
 
 # -----------------------------------------------------------------------------
@@ -48,13 +48,13 @@ check_gpus() {
     echo -e "  GPUs detected: ${CYAN}${GPU_COUNT}x ${GPU_NAME}${NC}"
     echo -e "  Memory per GPU: ${CYAN}${GPU_MEMORY} MB${NC}"
 
-    if [ "$GPU_COUNT" -lt 4 ]; then
-        echo -e "${YELLOW}WARNING: Expected 4 GPUs but found ${GPU_COUNT}.${NC}"
+    if [ "$GPU_COUNT" -lt 7 ]; then
+        echo -e "${YELLOW}WARNING: Expected 7 GPUs but found ${GPU_COUNT}.${NC}"
         echo -e "${YELLOW}Training will work but may be slower than estimated.${NC}"
     fi
 
-    if [ "$GPU_COUNT" -ge 4 ]; then
-        echo -e "${GREEN}✓ 4+ GPUs detected - optimal configuration${NC}"
+    if [ "$GPU_COUNT" -ge 7 ]; then
+        echo -e "${GREEN}✓ 7+ GPUs detected - optimal configuration${NC}"
     fi
 
     # Check NVLINK topology
@@ -157,15 +157,15 @@ install_python_deps() {
     # Upgrade pip
     pip install --upgrade pip -q
 
-    # Core ML libraries (compatible with H100) - MUST install torch, torchvision, torchaudio together
-    # torchvision 0.17.0 is compatible with torch 2.2.0
-    echo -e "  Installing PyTorch stack (torch 2.2.0 + torchvision 0.17.0 + torchaudio 2.2.0)..."
-    pip install -q torch==2.2.0 torchvision==0.17.0 torchaudio==2.2.0 --index-url https://download.pytorch.org/whl/cu121
+    # Core ML libraries (compatible with H200) - MUST install torch, torchvision, torchaudio together
+    # H200 uses Hopper architecture, works best with PyTorch 2.4+ and CUDA 12.4+
+    echo -e "  Installing PyTorch stack (torch 2.5.1 + torchvision 0.20.1 + torchaudio 2.5.1)..."
+    pip install -q torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu124
 
-    # Pin numpy<2.0 for PyTorch 2.2.0 compatibility (PyTorch 2.2 was compiled with NumPy 1.x)
+    # PyTorch 2.5 supports NumPy 2.x
     # Pin fsspec for datasets compatibility
     echo -e "  Installing numpy and fsspec with version constraints..."
-    pip install -q "numpy<2.0" "fsspec>=2023.5.0,<=2025.10.0"
+    pip install -q "numpy>=1.26.0" "fsspec>=2023.5.0"
 
     # Transformers ecosystem - pin transformers to avoid torchvision conflicts
     # Pin datasets<3.0.0 to use soundfile for audio (not torchcodec which needs PyTorch 2.4+)

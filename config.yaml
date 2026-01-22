@@ -2,8 +2,8 @@
 # Distil-CrisperWhisper Training Configuration
 # =============================================================================
 # ALL-IN CONFIG: Matching Official Distil-Whisper v3.5 Methodology
-# Hardware: 4x H100 NVL (94GB each) on RunPod
-# Cost: ~$10.44/hr (spot) | Total budget: ~$900
+# Hardware: 7x H200 (141GB each) on RunPod = 987GB total VRAM
+# Cost: ~$25/hr (spot) | Much faster training with 7 GPUs
 #
 # OFFICIAL DISTIL-WHISPER V3.5 SPECS:
 # - 196,000 hours raw audio → 98,000 hours after WER filtering
@@ -58,11 +58,12 @@ teacher:
 
   # Batch size for generating pseudo-labels per GPU
   # This is the KEY setting for GPU utilization!
+  # H200 141GB: can handle 64-80 samples per batch with 30s audio
   # H100 94GB: can handle 48-64 samples per batch with 30s audio
   # A100 80GB: can handle 32-48 samples per batch
   # A100 40GB: can handle 16-24 samples per batch
-  # 4x H100 NVL: 48 per device * 4 GPUs = 192 effective batch
-  pseudo_label_batch_size: 48
+  # 7x H200: 64 per device * 7 GPUs = 448 effective batch
+  pseudo_label_batch_size: 64
 
   # Attention implementation (sdpa is fastest on H100)
   attn_implementation: "sdpa"
@@ -244,15 +245,14 @@ training:
   # Effective batch size = per_device * accumulation * num_gpus
   # Official v3.5 uses 4096 on 64 H100s
   # Scales UP with more GPUs (more throughput!):
+  #   7x H200: 48 * 8 * 7 = 2688 effective batch (excellent throughput!)
   #   4x H100: 32 * 8 * 4 = 1024 effective batch
-  #   5x H100: 32 * 8 * 5 = 1280 effective batch
-  #   6x H100: 32 * 8 * 6 = 1536 effective batch (50% more throughput!)
-  per_device_train_batch_size: 32
+  per_device_train_batch_size: 48  # H200 has 141GB VRAM, can handle larger batches
   gradient_accumulation_steps: 8
 
   # Number of GPUs - auto-detected at runtime, this is just for reference
-  # Supports 4-6 GPUs (or more). Scripts auto-scale to available GPUs.
-  num_gpus: 4  # Will be overridden by actual GPU count
+  # Supports any number of GPUs. Scripts auto-scale to available GPUs.
+  num_gpus: 7  # Will be overridden by actual GPU count
 
   # Learning rate schedule - OFFICIAL USES LINEAR
   learning_rate: 1.0e-4

@@ -1,19 +1,19 @@
 # =============================================================================
 # Distil-CrisperWhisper Training Requirements
 # =============================================================================
-# Tested on: Python 3.10, CUDA 12.1, 4x H100 NVL
+# Tested on: Python 3.10, CUDA 12.4, 7x H200
 # Install with: pip install -r requirements.txt
 #
-# For H100 NVL:
-#   pip install torch==2.2.0 torchaudio==2.2.0 --index-url https://download.pytorch.org/whl/cu121
+# For H200:
+#   pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu124
 #   pip install -r requirements.txt
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# Core ML Frameworks (H100 NVL compatible)
+# Core ML Frameworks (H200 compatible)
 # -----------------------------------------------------------------------------
-# Note: Install PyTorch separately with CUDA 12.1 for H100:
-# pip install torch==2.2.0 torchaudio==2.2.0 --index-url https://download.pytorch.org/whl/cu121
+# Note: Install PyTorch separately with CUDA 12.4 for H200:
+# pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu124
 transformers>=4.40.0
 accelerate>=0.29.0
 datasets>=2.18.0
@@ -43,7 +43,7 @@ jiwer>=3.0.0
 # Data Processing
 # -----------------------------------------------------------------------------
 pandas>=2.0.0
-numpy>=1.24.0,<2.0.0
+numpy>=1.26.0
 tqdm>=4.66.0
 pyarrow>=14.0.0
 
