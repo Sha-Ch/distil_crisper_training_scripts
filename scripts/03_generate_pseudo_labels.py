@@ -93,6 +93,84 @@ class WhisperTextNormalizer:
         return text
 
 
+def are_spelling_variants(word1: str, word2: str, threshold: float = 0.85) -> bool:
+    """
+    Check if two words are spelling variants (e.g., British vs American).
+
+    Uses difflib.SequenceMatcher to check similarity ratio.
+    Examples: colour/color (0.91), realise/realize (0.86), behaviour/behavior (0.94)
+
+    Args:
+        word1: First word
+        word2: Second word
+        threshold: Similarity threshold (default 0.85 catches most UK/US variants)
+
+    Returns:
+        True if words are similar enough to be considered equivalent
+    """
+    from difflib import SequenceMatcher
+
+    if word1 == word2:
+        return True
+    # Must start with same letter to be a spelling variant
+    if not word1 or not word2 or word1[0] != word2[0]:
+        return False
+    # Check similarity ratio
+    return SequenceMatcher(None, word1, word2).ratio() >= threshold
+
+
+def calculate_wer_spelling_tolerant(reference: str, hypothesis: str) -> float:
+    """
+    Calculate WER with tolerance for British/American spelling variants.
+
+    Uses dynamic programming (Levenshtein distance) but treats spelling variants
+    as matches rather than substitutions.
+
+    Args:
+        reference: Reference text (normalized)
+        hypothesis: Hypothesis text (normalized)
+
+    Returns:
+        WER as float between 0.0 and 1.0 (or higher)
+    """
+    ref_words = reference.split()
+    hyp_words = hypothesis.split()
+
+    n = len(ref_words)
+    m = len(hyp_words)
+
+    # Edge cases
+    if n == 0:
+        return 1.0 if m > 0 else 0.0
+    if m == 0:
+        return 1.0
+
+    # DP table for edit distance
+    dp = [[0] * (m + 1) for _ in range(n + 1)]
+
+    # Initialize base cases
+    for i in range(n + 1):
+        dp[i][0] = i  # Deletions
+    for j in range(m + 1):
+        dp[0][j] = j  # Insertions
+
+    # Fill DP table
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            # Check if words match (exact or spelling variant)
+            if are_spelling_variants(ref_words[i-1], hyp_words[j-1]):
+                dp[i][j] = dp[i-1][j-1]  # No cost - words are equivalent
+            else:
+                dp[i][j] = min(
+                    dp[i-1][j] + 1,      # Deletion
+                    dp[i][j-1] + 1,      # Insertion
+                    dp[i-1][j-1] + 1     # Substitution
+                )
+
+    # WER = edit_distance / reference_length
+    return dp[n][m] / n
+
+
 @dataclass
 class PseudoLabel:
     """Represents pseudo-labels for a single audio sample."""
@@ -472,7 +550,7 @@ class PseudoLabelGenerator:
         for entry, transcription in zip(valid_entries, transcriptions):
             ground_truth = entry.get('text', '')
 
-            # Calculate WER
+            # Calculate WER with British/American spelling tolerance
             normalized_pseudo = self.normalizer(transcription)
             normalized_ground_truth = self.normalizer(ground_truth)
 
@@ -482,7 +560,7 @@ class PseudoLabelGenerator:
                 wer_score = 1.0
             else:
                 try:
-                    wer_score = calculate_wer(normalized_ground_truth, normalized_pseudo)
+                    wer_score = calculate_wer_spelling_tolerant(normalized_ground_truth, normalized_pseudo)
                 except Exception:
                     wer_score = 1.0
 

@@ -1253,17 +1253,89 @@ class MultiGPUPseudoLabelGenerator:
             # Progress is saved incrementally, just log
             console.print("[green]Progress already saved incrementally[/green]")
 
+    def _are_spelling_variants(self, word1: str, word2: str, threshold: float = 0.85) -> bool:
+        """
+        Check if two words are spelling variants (e.g., British vs American).
+
+        Uses difflib.SequenceMatcher to check similarity ratio.
+        Examples: colour/color (0.91), realise/realize (0.86), behaviour/behavior (0.94)
+
+        Args:
+            word1: First word
+            word2: Second word
+            threshold: Similarity threshold (default 0.85 catches most UK/US variants)
+
+        Returns:
+            True if words are similar enough to be considered equivalent
+        """
+        from difflib import SequenceMatcher
+
+        if word1 == word2:
+            return True
+        # Must start with same letter to be a spelling variant
+        if not word1 or not word2 or word1[0] != word2[0]:
+            return False
+        # Check similarity ratio
+        return SequenceMatcher(None, word1, word2).ratio() >= threshold
+
+    def _calculate_wer_spelling_tolerant(self, ref_words: list, hyp_words: list) -> float:
+        """
+        Calculate WER with tolerance for British/American spelling variants.
+
+        Uses dynamic programming (Levenshtein distance) but treats spelling variants
+        as matches rather than substitutions.
+
+        Args:
+            ref_words: List of reference words (normalized)
+            hyp_words: List of hypothesis words (normalized)
+
+        Returns:
+            WER as float between 0.0 and 1.0 (or higher)
+        """
+        n = len(ref_words)
+        m = len(hyp_words)
+
+        # Edge cases
+        if n == 0:
+            return 1.0 if m > 0 else 0.0
+        if m == 0:
+            return 1.0
+
+        # DP table for edit distance
+        dp = [[0] * (m + 1) for _ in range(n + 1)]
+
+        # Initialize base cases
+        for i in range(n + 1):
+            dp[i][0] = i  # Deletions
+        for j in range(m + 1):
+            dp[0][j] = j  # Insertions
+
+        # Fill DP table
+        for i in range(1, n + 1):
+            for j in range(1, m + 1):
+                # Check if words match (exact or spelling variant)
+                if self._are_spelling_variants(ref_words[i-1], hyp_words[j-1]):
+                    dp[i][j] = dp[i-1][j-1]  # No cost - words are equivalent
+                else:
+                    dp[i][j] = min(
+                        dp[i-1][j] + 1,      # Deletion
+                        dp[i][j-1] + 1,      # Insertion
+                        dp[i-1][j-1] + 1     # Substitution
+                    )
+
+        # WER = edit_distance / reference_length
+        return dp[n][m] / n
+
     def _calculate_wer(self, reference: str, hypothesis: str) -> float:
         """
-        Calculate Word Error Rate using official distil-whisper methodology.
+        Calculate Word Error Rate with tolerance for British/American spelling variants.
 
-        Matches: https://github.com/huggingface/distil-whisper/blob/main/training/run_distillation.py
+        Based on official distil-whisper methodology but extended to accept both
+        British and American spellings as equivalent (e.g., colour/color, realise/realize).
 
         Returns:
             WER as float between 0.0 and 1.0 (or higher for very bad transcriptions)
         """
-        from jiwer import wer as calculate_wer
-
         # Check for all-uppercase transcription (erroneous generation from Whisper)
         # Official distil-whisper filters these out
         if hypothesis is not None and hypothesis.upper() == hypothesis and len(hypothesis) > 0:
@@ -1280,7 +1352,9 @@ class MultiGPUPseudoLabelGenerator:
             return 1.0  # Empty hypothesis is 100% error
 
         try:
-            return calculate_wer(ref, hyp)
+            ref_words = ref.split()
+            hyp_words = hyp.split()
+            return self._calculate_wer_spelling_tolerant(ref_words, hyp_words)
         except Exception:
             return 1.0
 
@@ -1295,9 +1369,11 @@ class MultiGPUPseudoLabelGenerator:
         - Lowercase conversion
         - Punctuation removal
         - Number to word conversion ("3" -> "three")
-        - British to American spelling ("colour" -> "color")
         - Contractions normalization
         - Unicode normalization
+
+        Note: British/American spelling differences are handled separately in
+        _calculate_wer_spelling_tolerant() which accepts both variants as equivalent.
 
         Additionally strips filler words so CrisperWhisper's verbatim transcription
         (with um, uh, etc.) doesn't get penalized when ground truth doesn't include them.
