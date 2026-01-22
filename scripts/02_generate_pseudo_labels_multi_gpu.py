@@ -1189,6 +1189,34 @@ class MultiGPUPseudoLabelGenerator:
 
         return processed_ids
 
+    def _count_processed_from_files(self, name: str) -> int:
+        """
+        Count total processed samples from output files (all GPUs).
+
+        This gives accurate progress across all GPUs by counting lines
+        in the JSONL output files. Used for progress bar display.
+        """
+        total = 0
+
+        # Count accepted samples from all GPUs
+        for filepath in self.pseudo_labels_dir.glob(f'{name}_gpu*_accepted.jsonl'):
+            try:
+                with open(filepath, 'rb') as f:
+                    # Fast line counting using buffer
+                    total += sum(1 for _ in f)
+            except Exception:
+                pass
+
+        # Count rejected samples from all GPUs
+        for filepath in self.pseudo_labels_dir.glob(f'{name}_gpu*_rejected.jsonl'):
+            try:
+                with open(filepath, 'rb') as f:
+                    total += sum(1 for _ in f)
+            except Exception:
+                pass
+
+        return total
+
     def _save_progress(self, progress: Dict[str, DatasetProgress]):
         """
         Save processing progress.
@@ -1628,15 +1656,19 @@ class MultiGPUPseudoLabelGenerator:
         # Process samples with BATCHING using threaded prefetcher
         with open(output_file, mode) as out_f, open(rejected_file, mode) as rej_f:
             # Progress bar only on main process
+            # Track actual processed count from files (accurate across all GPUs)
             if self.is_main:
+                initial_processed = self._count_processed_from_files(name)
                 pbar = tqdm(
                     desc=f"Processing {name} (GPU {self.local_rank}, batch={self.batch_size})",
                     total=pbar_total,  # Use actual count or estimate
                     unit="samples",
-                    initial=len(already_processed_ids)  # Start from resumed position (all GPUs combined)
+                    initial=initial_processed  # Start from actual file counts
                 )
+                last_pbar_update_time = time.time()
             else:
                 pbar = None
+                last_pbar_update_time = 0
 
             last_sample_idx = 0
             gpu_starvation_count = 0  # Track how often GPU had to wait for data
@@ -1691,11 +1723,21 @@ class MultiGPUPseudoLabelGenerator:
                 out_f.flush()
                 rej_f.flush()
 
-                # Update progress bar
+                # Update progress bar with accurate file-based counts
                 if pbar:
                     prefetch_stats = prefetcher.get_stats()
                     acc_rate = progress.acceptance_rate * 100
                     avg_wer = progress.avg_wer * 100
+
+                    # Periodically refresh total count from files (every 5 seconds)
+                    # This gives accurate progress across all GPUs
+                    current_time = time.time()
+                    if current_time - last_pbar_update_time >= 5.0:
+                        total_processed = self._count_processed_from_files(name)
+                        pbar.n = total_processed  # Set absolute position
+                        pbar.refresh()
+                        last_pbar_update_time = current_time
+
                     pbar.set_postfix({
                         'acc': f'{acc_rate:.1f}%',
                         'wer': f'{avg_wer:.1f}%',
@@ -1703,7 +1745,6 @@ class MultiGPUPseudoLabelGenerator:
                         'q': prefetch_stats['queue_size'],  # Processed queue size
                         'w': prefetch_stats['workers_active'],  # Active workers
                     })
-                    pbar.update(len(batch_data))
 
                 # Save progress periodically
                 if progress.samples_processed % 500 == 0:
