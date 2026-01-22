@@ -186,32 +186,15 @@ def get_dataset_estimates(pseudo_labels_dir: Path, file_stats: dict, progress_da
         }
 
     # Override with actual counts from metadata files (highest priority)
+    # These are created by the processing script when it downloads datasets
     actual_counts = load_actual_sample_counts(pseudo_labels_dir)
     for name, data in actual_counts.items():
         estimates[name] = data
 
-    # Also use completed dataset counts as truth
-    datasets_info = progress_data.get('datasets', {})
-    for name, ds_info in datasets_info.items():
-        status = ds_info.get('status', '')
-        if name in file_stats:
-            stats = file_stats[name]
-            actual_processed = stats['accepted'] + stats['rejected']
-
-            # If completed and has data, use that as the actual count
-            if status == 'completed' and actual_processed > 0:
-                if name in estimates:
-                    estimates[name] = {
-                        'samples': actual_processed,
-                        'hours': estimates[name].get('hours', 0),
-                        'source': 'completed'
-                    }
-                else:
-                    estimates[name] = {
-                        'samples': actual_processed,
-                        'hours': 0,
-                        'source': 'completed'
-                    }
+    # NOTE: We do NOT use "completed" status to determine total sample count
+    # because a dataset can be marked "completed" even if it was interrupted
+    # or if only a subset was processed. The metadata files and hardcoded
+    # values are the source of truth for actual dataset sizes.
 
     return estimates
 
@@ -599,9 +582,9 @@ def create_dashboard(pseudo_labels_dir: Path, start_time: datetime):
         Layout(gpu_dist_table, name="distribution")
     )
 
-    # Footer - check if we have actual counts
+    # Footer - check if we have actual counts from metadata files
     all_estimates = get_dataset_estimates(pseudo_labels_dir, file_stats, progress_data)
-    actual_count = sum(1 for e in all_estimates.values() if e.get('source') in ('actual', 'completed'))
+    actual_count = sum(1 for e in all_estimates.values() if e.get('source') == 'actual')
     total_datasets = len(all_estimates)
 
     footer_text = Text()
