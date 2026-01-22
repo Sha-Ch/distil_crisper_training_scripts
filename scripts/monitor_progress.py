@@ -52,41 +52,50 @@ console = Console()
 # Sources:
 # - LibriSpeech: https://huggingface.co/datasets/openslr/librispeech_asr
 # - AMI: https://huggingface.co/datasets/edinburghcstr/ami
-# - TED-LIUM: https://www.tensorflow.org/datasets/catalog/tedlium (release3)
 # - PodcastFillers: https://huggingface.co/datasets/ylacombe/podcast_fillers_by_license
-# - GigaSpeech: https://huggingface.co/datasets/speechcolab/gigaspeech
 # - VoxPopuli: https://huggingface.co/datasets/facebook/voxpopuli
+# - TED-LIUM: https://www.tensorflow.org/datasets/catalog/tedlium (release3)
+# - GigaSpeech: https://huggingface.co/datasets/speechcolab/gigaspeech
 #
 # The processing script will also create {dataset}_metadata.json with exact counts
 # when downloading - those override these values if present.
+#
+# ORDER: Matches priority order in 02_generate_pseudo_labels_multi_gpu.py
 DATASET_ESTIMATES = {
-    # VERIFIED from HuggingFace documentation:
-    # LibriSpeech: train.clean.100 (28,539) + train.clean.360 (104,014) + train.other.500 (148,688)
+    # Priority 1: LibriSpeech - High quality, clean audio
+    # train.clean.100 (28,539) + train.clean.360 (104,014) + train.other.500 (148,688)
     'librispeech': {'hours': 960, 'samples': 281241},
 
-    # AMI IHM: 108,502 samples (from dataset card example output)
+    # Priority 2: AMI IHM - Critical for filler preservation
+    # 108,502 samples (from dataset card example output)
     'ami': {'hours': 100, 'samples': 108502},
 
-    # TED-LIUM release3: 268,263 samples (from TensorFlow Datasets catalog)
-    'tedlium': {'hours': 450, 'samples': 268263},
-
-    # PodcastFillers: 199 full episodes split by license (CC_BY_3.0: 100, CC_BY_SA_3.0: 79, CC_BY_ND_3.0: 20)
-    # Note: These are full episodes, not individual filler instances
+    # Priority 3: PodcastFillers - Explicit filler annotations
+    # 199 full episodes split by license (CC_BY_3.0: 100, CC_BY_SA_3.0: 79, CC_BY_ND_3.0: 20)
     'podcast_fillers': {'hours': 145, 'samples': 199},
 
-    # GigaSpeech XL: 10,000 hours - exact sample count not in docs, estimate ~2.5M
-    # XS has 9,389 samples for 10 hours, so XL (10,000h) would be ~1000x = ~2.5-3M
-    'gigaspeech': {'hours': 10000, 'samples': 2500000},
-
-    # VoxPopuli EN: 543 hours transcribed, ~182k samples estimated
-    # (exact count requires loading dataset)
+    # Priority 4: VoxPopuli EN - European Parliament formal speech
+    # 543 hours transcribed, ~182k samples estimated
     'voxpopuli': {'hours': 543, 'samples': 182000},
 
-    # Common Voice 17 EN: requires Mozilla Data Collective access, estimate ~1.2M
+    # Priority 5: Common Voice 17 EN - Crowdsourced diverse speakers
+    # Requires Mozilla Data Collective access, estimate ~1.2M
     'common_voice': {'hours': 3000, 'samples': 1200000},
 
-    # Streaming only - large estimates:
+    # Priority 6: TED-LIUM release3 - Professional presentations
+    # 268,263 samples (from TensorFlow Datasets catalog)
+    'tedlium': {'hours': 450, 'samples': 268263},
+
+    # Priority 7: GigaSpeech XL - YouTube/podcasts/audiobooks
+    # 10,000 hours - XS has 9,389 samples for 10 hours, so XL ~2.5-3M
+    'gigaspeech': {'hours': 10000, 'samples': 2500000},
+
+    # Priority 8: People's Speech - Large scale diverse
+    # Streaming only - large estimates
     'peoples_speech': {'hours': 30000, 'samples': 9000000},
+
+    # Priority 9: YODAS - Massive YouTube dataset
+    # Streaming only - very large estimates
     'yodas': {'hours': 150000, 'samples': 50000000},
 }
 
@@ -343,9 +352,11 @@ def create_dataset_table(file_stats, progress_data, pseudo_labels_dir: Path):
     table.add_column("WER", justify="right", width=5)
     table.add_column("Status", justify="center", width=9)
 
-    # Dataset order by priority (librispeech first to finish existing progress)
-    dataset_order = ['librispeech', 'ami', 'podcast_fillers', 'gigaspeech',
-                     'voxpopuli', 'common_voice', 'tedlium', 'peoples_speech', 'yodas']
+    # Dataset order by priority (matches 02_generate_pseudo_labels_multi_gpu.py)
+    # 1=librispeech, 2=ami, 3=podcast_fillers, 4=voxpopuli, 5=common_voice,
+    # 6=tedlium, 7=gigaspeech, 8=peoples_speech, 9=yodas
+    dataset_order = ['librispeech', 'ami', 'podcast_fillers', 'voxpopuli',
+                     'common_voice', 'tedlium', 'gigaspeech', 'peoples_speech', 'yodas']
 
     total_processed = 0
     total_estimated = 0
