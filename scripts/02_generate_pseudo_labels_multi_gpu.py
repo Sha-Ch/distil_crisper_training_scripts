@@ -68,6 +68,9 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeEl
 from rich.table import Table
 from rich.panel import Panel
 
+# Official Whisper text normalizer (matches distil-whisper methodology)
+from transformers.models.whisper.english_normalizer import EnglishTextNormalizer
+
 # Suppress warnings
 warnings.filterwarnings('ignore')
 
@@ -1251,17 +1254,30 @@ class MultiGPUPseudoLabelGenerator:
             console.print("[green]Progress already saved incrementally[/green]")
 
     def _calculate_wer(self, reference: str, hypothesis: str) -> float:
-        """Calculate Word Error Rate."""
+        """
+        Calculate Word Error Rate using official distil-whisper methodology.
+
+        Matches: https://github.com/huggingface/distil-whisper/blob/main/training/run_distillation.py
+
+        Returns:
+            WER as float between 0.0 and 1.0 (or higher for very bad transcriptions)
+        """
         from jiwer import wer as calculate_wer
 
-        # Normalize
+        # Check for all-uppercase transcription (erroneous generation from Whisper)
+        # Official distil-whisper filters these out
+        if hypothesis is not None and hypothesis.upper() == hypothesis and len(hypothesis) > 0:
+            return 1.0  # Reject all-caps as error
+
+        # Normalize both texts
         ref = self._normalize_text(reference)
         hyp = self._normalize_text(hypothesis)
 
+        # Handle edge cases (matches official implementation)
         if not ref:
-            return 0.0 if not hyp else 1.0
+            return 1.0  # Can't compute WER with empty reference, reject
         if not hyp:
-            return 1.0
+            return 1.0  # Empty hypothesis is 100% error
 
         try:
             return calculate_wer(ref, hyp)
@@ -1269,30 +1285,45 @@ class MultiGPUPseudoLabelGenerator:
             return 1.0
 
     def _normalize_text(self, text: str) -> str:
-        """Normalize text for WER calculation.
+        """
+        Normalize text for WER calculation using official Whisper EnglishTextNormalizer.
 
-        Strips filler words so CrisperWhisper's verbatim transcription
-        (with um, uh, etc.) doesn't get penalized when ground truth
-        doesn't include them.
+        This matches the official distil-whisper methodology:
+        https://github.com/huggingface/distil-whisper/blob/main/training/run_distillation.py
 
-        CrisperWhisper outputs fillers in brackets like [Um], [Uh], etc.
+        The normalizer handles:
+        - Lowercase conversion
+        - Punctuation removal
+        - Number to word conversion ("3" -> "three")
+        - British to American spelling ("colour" -> "color")
+        - Contractions normalization
+        - Unicode normalization
+
+        Additionally strips filler words so CrisperWhisper's verbatim transcription
+        (with um, uh, etc.) doesn't get penalized when ground truth doesn't include them.
         """
         if not text:
             return ""
 
+        # Initialize normalizer if not already done (lazy init for efficiency)
+        if not hasattr(self, '_english_normalizer'):
+            self._english_normalizer = EnglishTextNormalizer({})
+
         # Remove bracketed fillers first (CrisperWhisper format: [Um], [Uh], etc.)
+        # Do this BEFORE the normalizer since normalizer may not handle brackets well
         text = re.sub(r'\[(?:um|uh|er|ah|uhm|erm|hmm|hm|mm|mhm)\]', '', text, flags=re.IGNORECASE)
 
-        text = text.lower()
-        text = re.sub(r'[^\w\s\']', '', text)  # Remove punctuation except apostrophes
+        # Apply official Whisper English normalizer
+        # This handles: lowercase, punctuation, numbers->words, spelling normalization, etc.
+        text = self._english_normalizer(text)
 
         # Strip standalone filler words (in case they appear without brackets)
-        FILLER_WORDS = {'um', 'uh', 'er', 'ah', 'uhm', 'erm', 'hmm', 'hm', 'mm', 'mhm'}
+        # These are common in verbatim transcriptions but often missing from ground truth
+        FILLER_WORDS = {'um', 'uh', 'er', 'ah', 'uhm', 'erm', 'hmm', 'hm', 'mm', 'mhm', 'uh huh', 'mm hmm'}
         words = text.split()
         words = [w for w in words if w not in FILLER_WORDS]
 
-        text = ' '.join(words)
-        return text
+        return ' '.join(words)
 
     def _load_dataset(self, name: str, skip_to: int = 0) -> Tuple[Optional[Iterator], Optional[int]]:
         """
