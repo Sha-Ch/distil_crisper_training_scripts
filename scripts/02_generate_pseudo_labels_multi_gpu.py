@@ -2015,6 +2015,9 @@ class MultiGPUPseudoLabelGenerator:
                         all_progress[name] = DatasetProgress(**existing)
                     else:
                         all_progress[name] = existing
+                    # IMPORTANT: Still need to sync with other GPUs to prevent deadlock
+                    if self.is_distributed:
+                        dist.barrier()
                     continue
 
             if self.is_main:
