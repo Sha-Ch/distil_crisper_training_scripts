@@ -520,13 +520,18 @@ class ThreadedPrefetcher:
                 # Update local duration stats
                 local_duration += duration / 3600
 
-                # Skip if already processed (O(1) hash set lookup)
-                if sample_id in self.already_processed_ids:
+                # Normalize ground_truth once for both dedup and sharding
+                ground_truth_normalized = ground_truth.strip()
+
+                # Skip if already processed (O(1) hash set lookup using ground_truth text)
+                # Using ground_truth instead of sample_id because audio hashes can vary between runs
+                if ground_truth_normalized in self.already_processed_ids:
                     local_skipped += 1
                     continue
 
-                # Multi-GPU sharding - deterministic based on content hash
-                shard_key = int(hashlib.md5(sample_id.encode()).hexdigest()[:8], 16)
+                # Multi-GPU sharding - deterministic based on ground_truth text
+                # Using ground_truth ensures same sample always goes to same GPU
+                shard_key = int(hashlib.md5(ground_truth_normalized.encode()).hexdigest()[:8], 16)
                 if shard_key % self.world_size != self.local_rank:
                     continue
 
@@ -1137,23 +1142,26 @@ class MultiGPUPseudoLabelGenerator:
 
     def _load_processed_ids_from_files(self, name: str) -> set:
         """
-        Load already processed sample IDs from output files.
+        Load already processed ground_truth texts from output files.
+
+        Uses ground_truth (actual transcript text) for deduplication instead of
+        content hashes, because audio byte representation can vary between runs.
 
         This allows resuming even if progress.json was lost, by scanning
         the actual output files from ALL GPUs.
 
-        OPTIMIZATION: Uses a cached ID file for O(1) resume when possible.
+        OPTIMIZATION: Uses a cached file for O(1) resume when possible.
         The cache is invalidated if JSONL files are newer than the cache.
         """
-        processed_ids = set()
-        cache_file = self.pseudo_labels_dir / f'{name}_processed_ids.cache'
+        processed_texts = set()
+        cache_file = self.pseudo_labels_dir / f'{name}_processed_texts.cache'
 
         # Get modification times of all JSONL files
         jsonl_files = list(self.pseudo_labels_dir.glob(f'{name}_gpu*_accepted.jsonl'))
         jsonl_files.extend(self.pseudo_labels_dir.glob(f'{name}_gpu*_rejected.jsonl'))
 
         if not jsonl_files:
-            return processed_ids
+            return processed_texts
 
         latest_jsonl_mtime = max(f.stat().st_mtime for f in jsonl_files)
 
@@ -1164,16 +1172,16 @@ class MultiGPUPseudoLabelGenerator:
                 # Cache is valid - O(n) read but faster than JSON parsing
                 try:
                     with open(cache_file, 'r') as f:
-                        processed_ids = set(line.strip() for line in f if line.strip())
+                        processed_texts = set(line.strip() for line in f if line.strip())
                     if self.is_main:
-                        console.print(f"[green]Loaded {len(processed_ids):,} IDs from cache (fast resume)[/green]")
-                    return processed_ids
+                        console.print(f"[green]Loaded {len(processed_texts):,} texts from cache (fast resume)[/green]")
+                    return processed_texts
                 except Exception:
                     pass  # Fall through to rebuild cache
 
         # Cache miss or invalid - scan JSONL files
         if self.is_main:
-            console.print(f"[yellow]Building ID cache from JSONL files...[/yellow]")
+            console.print(f"[yellow]Building text cache from JSONL files...[/yellow]")
 
         for jsonl_file in jsonl_files:
             try:
@@ -1181,24 +1189,25 @@ class MultiGPUPseudoLabelGenerator:
                     for line in f:
                         try:
                             entry = json.loads(line)
-                            sample_id = entry.get('sample_id', '')
-                            if sample_id:
-                                processed_ids.add(sample_id)
+                            # Use ground_truth for deduplication (stable across runs)
+                            ground_truth = entry.get('ground_truth', '').strip()
+                            if ground_truth:
+                                processed_texts.add(ground_truth)
                         except json.JSONDecodeError:
                             continue
             except Exception:
                 pass
 
         # Save cache for next time (only main process to avoid race)
-        if self.is_main and processed_ids:
+        if self.is_main and processed_texts:
             try:
                 with open(cache_file, 'w') as f:
-                    f.write('\n'.join(processed_ids))
-                console.print(f"[green]Saved ID cache ({len(processed_ids):,} IDs)[/green]")
+                    f.write('\n'.join(processed_texts))
+                console.print(f"[green]Saved text cache ({len(processed_texts):,} texts)[/green]")
             except Exception:
                 pass
 
-        return processed_ids
+        return processed_texts
 
     def _count_processed_from_files(self, name: str) -> int:
         """
@@ -1677,20 +1686,21 @@ class MultiGPUPseudoLabelGenerator:
         # CONTENT-BASED RESUME: Load processed sample IDs from ALL output files
         # IDs are now content-based hashes (e.g., "ami_a1b2c3d4e5f6g7h8")
         # This ensures same audio+text always gets same ID regardless of:
-        # - Dataset iteration order (which may vary between runs!)
-        # - GPU count or which GPU processes it
-        # - Run number
+        # TEXT-BASED RESUME: Load processed ground_truth texts from ALL output files
+        # Using ground_truth text (not audio hash) ensures reliable deduplication because:
+        # - Same text = same sample, regardless of audio byte differences
+        # - Stable across runs, GPU counts, iteration order
         #
         # MULTI-GPU SYNC: Main process loads first (and writes cache), then barrier,
         # then other GPUs load from cache. This avoids race conditions.
-        already_processed_ids = set()
+        already_processed_ids = set()  # Contains ground_truth texts, not sample_ids
         if resume:
             if self.is_main:
                 # Main process loads and writes cache
                 already_processed_ids = self._load_processed_ids_from_files(name)
                 if already_processed_ids:
                     console.print(f"[green]Found {len(already_processed_ids):,} already processed samples for {name}[/green]")
-                    console.print(f"[cyan]Using content-based deduplication (order-independent)[/cyan]")
+                    console.print(f"[cyan]Using ground_truth text deduplication (stable across runs)[/cyan]")
 
             # Synchronize so other GPUs wait for cache to be written
             if self.is_distributed:
