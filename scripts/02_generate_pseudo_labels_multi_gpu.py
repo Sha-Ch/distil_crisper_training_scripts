@@ -1169,10 +1169,10 @@ class MultiGPUPseudoLabelGenerator:
         if cache_file.exists():
             cache_mtime = cache_file.stat().st_mtime
             if cache_mtime >= latest_jsonl_mtime:
-                # Cache is valid - O(n) read but faster than JSON parsing
+                # Cache is valid - load from JSON
                 try:
                     with open(cache_file, 'r') as f:
-                        processed_texts = set(line.strip() for line in f if line.strip())
+                        processed_texts = set(json.load(f))
                     if self.is_main:
                         console.print(f"[green]Loaded {len(processed_texts):,} texts from cache (fast resume)[/green]")
                     return processed_texts
@@ -1199,10 +1199,11 @@ class MultiGPUPseudoLabelGenerator:
                 pass
 
         # Save cache for next time (only main process to avoid race)
+        # Use JSON for cache to handle texts with newlines safely
         if self.is_main and processed_texts:
             try:
                 with open(cache_file, 'w') as f:
-                    f.write('\n'.join(processed_texts))
+                    json.dump(list(processed_texts), f)
                 console.print(f"[green]Saved text cache ({len(processed_texts):,} texts)[/green]")
             except Exception:
                 pass
