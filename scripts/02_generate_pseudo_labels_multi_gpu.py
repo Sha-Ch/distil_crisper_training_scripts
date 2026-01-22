@@ -404,10 +404,14 @@ class ThreadedPrefetcher:
         self.batch_size = batch_size
         self.num_workers = num_workers
 
-        # Raw sample queue (feeder -> workers) - unbounded for speed
-        self.raw_queue = Queue(maxsize=num_workers * 4)
+        # Raw sample queue (feeder -> workers)
+        # Size: enough to keep all workers busy + buffer
+        # With many workers (32+), need larger queue to prevent feeder blocking
+        self.raw_queue = Queue(maxsize=max(num_workers * 4, 128))
 
         # Processed sample queue (workers -> main) - bounded to control memory
+        # Size: prefetch_batches * batch_size samples ready for GPU
+        # This is the KEY buffer that prevents GPU starvation!
         self.processed_queue = Queue(maxsize=prefetch_batches * batch_size)
 
         self.stop_event = Event()
@@ -415,7 +419,6 @@ class ThreadedPrefetcher:
         self.exhausted = Event()    # Set when all workers are done
 
         # Thread-safe stats using locks
-        self._stats_lock = Event()  # Using Event as a simple flag
         import threading
         self._lock = threading.Lock()
         self._skipped_in_loop = 0
@@ -449,8 +452,13 @@ class ThreadedPrefetcher:
                     break
 
                 # Put raw sample with its index into queue
-                # Workers will do the heavy lifting (extraction, hashing, filtering)
-                self.raw_queue.put((sample, sample_idx))
+                # Use timeout to avoid blocking forever if queue is full
+                while not self.stop_event.is_set():
+                    try:
+                        self.raw_queue.put((sample, sample_idx), timeout=1.0)
+                        break
+                    except:
+                        continue  # Retry until stop or success
                 sample_idx += 1
 
         except Exception:
@@ -458,8 +466,14 @@ class ThreadedPrefetcher:
         finally:
             self.feeder_done.set()
             # Signal workers that no more raw samples are coming
+            # Use timeout to avoid deadlock if queue is full
             for _ in range(self.num_workers):
-                self.raw_queue.put(None)  # Poison pills
+                while not self.stop_event.is_set():
+                    try:
+                        self.raw_queue.put(None, timeout=1.0)  # Poison pill
+                        break
+                    except:
+                        continue
 
     def _worker_loop(self):
         """Worker thread: processes raw samples in parallel."""
@@ -484,6 +498,9 @@ class ThreadedPrefetcher:
                 # Process sample (extract audio, hash, filter)
                 result = self._process_sample(sample, sample_idx)
                 if result is None:
+                    continue
+                if result == 'duration_rejected':
+                    local_rejected += 1
                     continue
 
                 # Unpack to check dedup and sharding
@@ -534,7 +551,14 @@ class ThreadedPrefetcher:
                     self.exhausted.set()
 
     def _process_sample(self, sample, sample_idx: int):
-        """Process a single sample and generate content-based ID. Thread-safe."""
+        """
+        Process a single sample and generate content-based ID. Thread-safe.
+
+        Returns:
+            Tuple of (audio_array, sr, ground_truth, sample_id, duration, sample_idx)
+            OR 'duration_rejected' string if filtered by duration
+            OR None if invalid sample
+        """
         try:
             # Extract audio
             audio_data = sample.get(self.audio_col, {})
@@ -555,9 +579,9 @@ class ThreadedPrefetcher:
             # Calculate duration
             duration = len(audio_array) / sr
 
-            # Duration filter
+            # Duration filter - return marker so we can track stats
             if duration < self.min_duration or duration > self.max_duration:
-                return None
+                return 'duration_rejected'
 
             return (audio_array, sr, ground_truth, sample_id, duration, sample_idx)
 
@@ -565,22 +589,56 @@ class ThreadedPrefetcher:
             return None
 
     def get_batch(self, timeout: float = 30.0) -> List[Tuple]:
-        """Get a batch of preprocessed samples from the worker pool."""
+        """
+        Get a batch of preprocessed samples from the worker pool.
+
+        OPTIMIZATION: Returns partial batches after short wait to avoid GPU idling.
+        - First, try to get a full batch with short timeout (0.1s per item)
+        - If queue has items, return whatever we have (even if partial)
+        - Only wait longer if queue is completely empty
+
+        This ensures GPU stays busy even when prefetching is slightly behind.
+        """
         batch = []
         deadline = time.time() + timeout
 
+        # Phase 1: Quick collection - grab whatever is immediately available
         while len(batch) < self.batch_size:
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                break
-
             try:
-                item = self.processed_queue.get(timeout=min(remaining, 1.0))
+                # Very short timeout - don't wait long for each item
+                item = self.processed_queue.get(timeout=0.05)
                 batch.append(item)
             except Empty:
-                # Check if we're done (all workers finished and queue empty)
+                break  # Nothing immediately available
+
+        # Phase 2: If we got nothing, wait a bit longer for at least some data
+        if not batch:
+            while len(batch) < self.batch_size:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+
+                # Check if we're done
                 if self.exhausted.is_set() and self.processed_queue.empty():
                     break
+
+                try:
+                    item = self.processed_queue.get(timeout=min(remaining, 1.0))
+                    batch.append(item)
+
+                    # Once we have at least 25% of a batch, return it
+                    # This prevents GPU from waiting too long
+                    if len(batch) >= self.batch_size // 4:
+                        # Quick grab any more that are immediately ready
+                        while len(batch) < self.batch_size:
+                            try:
+                                item = self.processed_queue.get_nowait()
+                                batch.append(item)
+                            except Empty:
+                                break
+                        break
+                except Empty:
+                    continue
 
         return batch
 
@@ -1462,12 +1520,29 @@ class MultiGPUPseudoLabelGenerator:
         # - Dataset iteration order (which may vary between runs!)
         # - GPU count or which GPU processes it
         # - Run number
+        #
+        # MULTI-GPU SYNC: Main process loads first (and writes cache), then barrier,
+        # then other GPUs load from cache. This avoids race conditions.
         already_processed_ids = set()
         if resume:
-            already_processed_ids = self._load_processed_ids_from_files(name)
-            if already_processed_ids and self.is_main:
-                console.print(f"[green]Found {len(already_processed_ids):,} already processed samples for {name}[/green]")
-                console.print(f"[cyan]Using content-based deduplication (order-independent)[/cyan]")
+            if self.is_main:
+                # Main process loads and writes cache
+                already_processed_ids = self._load_processed_ids_from_files(name)
+                if already_processed_ids:
+                    console.print(f"[green]Found {len(already_processed_ids):,} already processed samples for {name}[/green]")
+                    console.print(f"[cyan]Using content-based deduplication (order-independent)[/cyan]")
+
+            # Synchronize so other GPUs wait for cache to be written
+            if self.is_distributed:
+                dist.barrier()
+
+            # Non-main GPUs load from cache (which main just created)
+            if not self.is_main:
+                already_processed_ids = self._load_processed_ids_from_files(name)
+
+            # Final sync to ensure all GPUs have loaded before proceeding
+            if self.is_distributed:
+                dist.barrier()
 
         # Always append mode if resuming with existing samples
         if resume and already_processed_ids:
@@ -1515,16 +1590,25 @@ class MultiGPUPseudoLabelGenerator:
             pbar_total = max_samples or config['estimated_hours'] * 120
 
         # Determine number of prefetch workers based on CPU cores
-        # Use ~half the cores for prefetching to leave room for other work
+        # Goal: Keep GPU 100% utilized by having enough workers to saturate I/O
+        #
+        # With 128 cores: use 32-64 workers (plenty of headroom)
+        # Rule: ~25% of cores for prefetch workers, capped at 64 (diminishing returns)
+        # Each worker handles: audio extraction, hashing, filtering
         import multiprocessing
         num_cpu_cores = multiprocessing.cpu_count()
-        num_prefetch_workers = max(4, min(num_cpu_cores // 2, 8))
+        num_prefetch_workers = max(8, min(num_cpu_cores // 4, 64))
 
         if self.is_main:
             console.print(f"[cyan]Using {num_prefetch_workers} prefetch threads ({num_cpu_cores} CPU cores available)[/cyan]")
 
         # Create threaded prefetcher for parallel sample loading
         # Uses content-based hashing for deduplication (order-independent!)
+        # CRITICAL: prefetch_batches must be high enough to keep GPU fed continuously
+        #
+        # With 128 cores / 32 workers: workers produce faster than GPU consumes
+        # Need large buffer to absorb I/O variance and keep GPU 100% busy
+        # 16 batches * 48 samples = 768 samples buffered (~25-30 seconds of runway)
         prefetcher = ThreadedPrefetcher(
             dataset_iter=dataset_iter,
             start_idx=0,  # Always start from 0, dedup handles resume
@@ -1536,7 +1620,7 @@ class MultiGPUPseudoLabelGenerator:
             min_duration=self.min_duration,
             max_duration=self.max_duration,
             name=name,
-            prefetch_batches=4,  # Prefetch 4 batches ahead
+            prefetch_batches=16,  # Prefetch 16 batches ahead - large buffer for 128 cores
             batch_size=self.batch_size,
             num_workers=num_prefetch_workers,
         )
@@ -1555,11 +1639,21 @@ class MultiGPUPseudoLabelGenerator:
                 pbar = None
 
             last_sample_idx = 0
+            gpu_starvation_count = 0  # Track how often GPU had to wait for data
+            total_batches = 0
 
             # Main processing loop - pull batches from prefetcher
             while not self.spot_handler.should_stop:
                 # Get a batch from the prefetcher (blocks until ready or timeout)
+                prefetch_stats_before = prefetcher.get_stats()
+                queue_was_empty = prefetch_stats_before['queue_size'] == 0
+
                 batch_data = prefetcher.get_batch(timeout=60.0)
+                total_batches += 1
+
+                # Track GPU starvation (queue was empty when we asked for data)
+                if queue_was_empty and batch_data:
+                    gpu_starvation_count += 1
 
                 if not batch_data:
                     # No more data
@@ -1637,10 +1731,19 @@ class MultiGPUPseudoLabelGenerator:
         progress.samples_rejected_duration += prefetch_stats['rejected_duration']
         progress.total_duration_hours += prefetch_stats['total_duration_hours']
 
-        # Log resume stats
+        # Log resume stats and GPU efficiency
         if self.is_main:
             if skipped_in_loop > 0:
                 console.print(f"[green]Skipped {skipped_in_loop:,} already-processed samples (content-based dedup)[/green]")
+
+            # Report GPU efficiency
+            if total_batches > 0:
+                starvation_rate = gpu_starvation_count / total_batches * 100
+                if starvation_rate > 10:
+                    console.print(f"[yellow]⚠ GPU starvation rate: {starvation_rate:.1f}% ({gpu_starvation_count}/{total_batches} batches)[/yellow]")
+                    console.print(f"[yellow]  Consider increasing prefetch_batches or num_workers[/yellow]")
+                else:
+                    console.print(f"[green]✓ GPU efficiency: {100-starvation_rate:.1f}% (queue kept fed)[/green]")
 
         # Final save
         progress.status = "completed"
