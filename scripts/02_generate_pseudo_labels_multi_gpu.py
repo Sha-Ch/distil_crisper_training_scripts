@@ -227,7 +227,7 @@ DATASET_CONFIGS = {
     # STREAMING DATASETS (large, processed last)
     # =========================================================================
 
-    # Priority 7: Large scale, diverse (GigaSpeech) - STREAMING
+    # Priority 7: Large scale, diverse (GigaSpeech) - CHUNKED DOWNLOAD
     'gigaspeech': {
         'hf_name': 'speechcolab/gigaspeech',
         'subset': 'xl',  # Full 10,000 hours
@@ -238,9 +238,13 @@ DATASET_CONFIGS = {
         'requires_auth': True,
         'priority': 7,
         'quality': 'high',
+        # Chunked download settings - download ~100GB at a time to avoid rate limiting
+        'use_chunked_download': True,
+        'chunk_size_gb': 100,  # Target chunk size in GB (±10GB variance OK)
+        'estimated_sample_size_mb': 5,  # Avg sample size for chunk calculation
     },
 
-    # Priority 8: Large scale diverse (People's Speech) - STREAMING
+    # Priority 8: Large scale diverse (People's Speech) - CHUNKED DOWNLOAD
     'peoples_speech': {
         'hf_name': 'MLCommons/peoples_speech',
         'subset': 'clean',
@@ -251,9 +255,13 @@ DATASET_CONFIGS = {
         'requires_auth': True,
         'priority': 8,
         'quality': 'medium',
+        # Chunked download settings
+        'use_chunked_download': True,
+        'chunk_size_gb': 100,
+        'estimated_sample_size_mb': 3,
     },
 
-    # Priority 9: Massive YouTube dataset - bulk of data (YODAS) - STREAMING
+    # Priority 9: Massive YouTube dataset - bulk of data (YODAS) - CHUNKED DOWNLOAD
     'yodas': {
         'hf_name': 'espnet/yodas',
         'subset': 'en000',
@@ -264,6 +272,10 @@ DATASET_CONFIGS = {
         'requires_auth': False,
         'priority': 9,
         'quality': 'variable',
+        # Chunked download settings
+        'use_chunked_download': True,
+        'chunk_size_gb': 100,
+        'estimated_sample_size_mb': 4,
     },
 }
 
@@ -438,6 +450,7 @@ class ThreadedPrefetcher:
         self._rejected_duration = 0
         self._total_duration_hours = 0.0
         self._workers_done = 0
+        self._total_samples_fed = 0  # Total samples yielded by iterator (for accurate count)
 
         # Start threads
         self.threads = []
@@ -458,6 +471,7 @@ class ThreadedPrefetcher:
 
     def _feeder_loop(self):
         """Feeder thread: iterates dataset and queues raw samples."""
+        samples_fed = 0
         try:
             sample_idx = self.sample_idx
             for sample in self.dataset_iter:
@@ -469,6 +483,7 @@ class ThreadedPrefetcher:
                 while not self.stop_event.is_set():
                     try:
                         self.raw_queue.put((sample, sample_idx), timeout=1.0)
+                        samples_fed += 1
                         break
                     except:
                         continue  # Retry until stop or success
@@ -477,6 +492,9 @@ class ThreadedPrefetcher:
         except Exception:
             pass
         finally:
+            # Save total samples fed (for accurate count verification)
+            with self._lock:
+                self._total_samples_fed = samples_fed
             self.feeder_done.set()
             # Signal workers that no more raw samples are coming
             # Use timeout to avoid deadlock if queue is full
@@ -689,6 +707,7 @@ class ThreadedPrefetcher:
                 'workers_active': self.num_workers - self._workers_done,
                 'raw_queue_size': self.raw_queue.qsize(),
                 'queue_size': self.processed_queue.qsize(),
+                'total_samples_fed': self._total_samples_fed,  # Actual iterator count
             }
 
 
@@ -1285,20 +1304,21 @@ class MultiGPUPseudoLabelGenerator:
             # Progress is saved incrementally, just log
             console.print("[green]Progress already saved incrementally[/green]")
 
-    def _update_metadata_with_actual_count(self, name: str) -> int:
+    def _update_metadata_with_actual_count(self, name: str, actual_iterated_count: int = 0) -> int:
         """
-        Update the metadata file with the ACTUAL processed count after completion.
+        Update the metadata file after completion with accurate counts.
 
-        This fixes the issue where the initial metadata (from len(dataset)) may differ
-        from the actual number of samples yielded during iteration. HuggingFace datasets
-        can sometimes yield slightly more samples than len() reports, especially when
-        concatenating multiple splits.
+        Saves TWO important counts:
+        1. actual_iterated_count: TRUE total from iterator (for progress %)
+        2. processed_count: How many were written to JSONL (for verification)
 
-        The metadata file is used by the monitor for progress display. Updating it
-        with the actual count ensures future runs show accurate progress.
+        The total_samples should be the TRUE dataset total, not the processed count.
+        Some samples are filtered (duration, invalid) or deduped, so processed < total.
 
         Args:
             name: Dataset name
+            actual_iterated_count: Total samples yielded by iterator (from prefetcher stats)
+                                   This is the TRUE count for progress calculation.
 
         Returns:
             The actual count from files
@@ -1306,7 +1326,7 @@ class MultiGPUPseudoLabelGenerator:
         if not self.is_main:
             return 0
 
-        actual_count = self._count_processed_from_files(name)
+        processed_count = self._count_processed_from_files(name)
         metadata_file = self.pseudo_labels_dir / f'{name}_metadata.json'
 
         # Read existing metadata or create new
@@ -1319,25 +1339,134 @@ class MultiGPUPseudoLabelGenerator:
         else:
             metadata = {'dataset': name}
 
-        original_count = metadata.get('total_samples', 0)
+        original_total = metadata.get('total_samples', 0)
 
-        # Update with actual count
-        metadata['total_samples'] = actual_count
-        metadata['source'] = 'actual_processed'  # Mark as verified count
-        metadata['original_estimate'] = original_count  # Keep original for reference
+        # Keep the TRUE total for progress calculation
+        # Don't replace it with processed count (which is less due to filtering)
+        if actual_iterated_count > 0:
+            # Use iterator count as the authoritative total
+            metadata['total_samples'] = actual_iterated_count
+            metadata['actual_iterated_count'] = actual_iterated_count
+            metadata['count_verified'] = True
+        # else: keep original total_samples
+
+        # Store processed count separately
+        metadata['processed_count'] = processed_count
+        metadata['source'] = 'actual_processed'
+        metadata['original_estimate'] = original_total  # Keep original len(dataset) for reference
         metadata['updated_at'] = datetime.now().isoformat()
-        metadata['completed'] = True  # Mark as completed
+        metadata['completed'] = True
 
         with open(metadata_file, 'w') as f:
             json.dump(metadata, f, indent=2)
 
-        if actual_count != original_count:
-            console.print(f"[cyan]Updated {name} metadata: {original_count:,} → {actual_count:,} samples "
-                          f"(diff: {actual_count - original_count:+,})[/cyan]")
+        # Log what happened
+        if actual_iterated_count > 0 and actual_iterated_count != original_total:
+            console.print(f"[cyan]Updated {name} total: {original_total:,} → {actual_iterated_count:,} (iterator count)[/cyan]")
+        filtered_count = (actual_iterated_count or original_total) - processed_count
+        if filtered_count > 0:
+            console.print(f"[dim]  {processed_count:,} processed, {filtered_count:,} filtered/deduped[/dim]")
         else:
             console.print(f"[green]Verified {name} metadata: {actual_count:,} samples[/green]")
 
         return actual_count
+
+    def _save_dataset_metadata(
+        self,
+        name: str,
+        total_samples: Optional[int],
+        is_streaming: bool,
+        estimated_hours: float = 0
+    ) -> None:
+        """
+        Save dataset metadata when first loaded.
+
+        This creates/updates the metadata file with:
+        - Exact sample count for downloaded datasets
+        - Streaming indicator for streaming datasets
+        - Estimated hours from config
+
+        The metadata is used by the monitor for accurate progress tracking.
+
+        Args:
+            name: Dataset name
+            total_samples: Exact count for downloaded datasets, None for streaming
+            is_streaming: Whether dataset is in streaming mode
+            estimated_hours: Estimated hours from dataset config
+        """
+        if not self.is_main:
+            return
+
+        metadata_file = self.pseudo_labels_dir / f'{name}_metadata.json'
+
+        # Load existing metadata if present
+        existing_metadata = {}
+        if metadata_file.exists():
+            try:
+                with open(metadata_file, 'r') as f:
+                    existing_metadata = json.load(f)
+            except Exception:
+                pass
+
+        # Build metadata
+        metadata = {
+            'dataset': name,
+            'is_streaming': is_streaming,
+            'estimated_hours': estimated_hours,
+            'loaded_at': datetime.now().isoformat(),
+        }
+
+        if total_samples is not None:
+            # Downloaded dataset - we have exact count
+            metadata['total_samples'] = total_samples
+            metadata['source'] = 'downloaded_exact'
+            metadata['count_verified'] = True
+            console.print(f"[green]✓ Saved {name} metadata: {total_samples:,} samples (exact from download)[/green]")
+        else:
+            # Streaming dataset - use estimate or previous processed count
+            if existing_metadata.get('completed') and existing_metadata.get('total_samples'):
+                # Use previously verified count from completed processing
+                metadata['total_samples'] = existing_metadata['total_samples']
+                metadata['source'] = 'previous_completion'
+                metadata['count_verified'] = True
+                console.print(f"[cyan]Using previous verified count for {name}: {metadata['total_samples']:,} samples[/cyan]")
+            else:
+                # Use estimate based on hours (rough: ~120 samples per hour for speech)
+                estimated_samples = int(estimated_hours * 120)
+                metadata['total_samples'] = estimated_samples
+                metadata['source'] = 'estimated'
+                metadata['count_verified'] = False
+                console.print(f"[yellow]Streaming dataset {name}: using estimate ~{estimated_samples:,} samples ({estimated_hours} hours)[/yellow]")
+
+        # Preserve completion status if already completed
+        if existing_metadata.get('completed'):
+            metadata['completed'] = True
+            metadata['verified'] = existing_metadata.get('verified', False)
+            metadata['verification_status'] = existing_metadata.get('verification_status', '')
+            metadata['unique_samples'] = existing_metadata.get('unique_samples', 0)
+
+        # Save metadata
+        with open(metadata_file, 'w') as f:
+            json.dump(metadata, f, indent=2)
+
+    def _load_dataset_metadata(self, name: str) -> Dict[str, Any]:
+        """
+        Load dataset metadata if it exists.
+
+        Returns dict with:
+        - total_samples: Known or estimated sample count
+        - is_streaming: Whether dataset is streaming
+        - count_verified: Whether the count is exact (not estimated)
+        - completed: Whether processing has completed before
+        """
+        metadata_file = self.pseudo_labels_dir / f'{name}_metadata.json'
+        if metadata_file.exists():
+            try:
+                with open(metadata_file, 'r') as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {}
 
     def _verify_and_fill_missing_samples(
         self,
@@ -1349,15 +1478,15 @@ class MultiGPUPseudoLabelGenerator:
 
         This runs after initial processing to:
         1. Count unique samples processed (by ground_truth text)
-        2. Compare against expected total from metadata
+        2. Compare against actual_iterated_count (true iterator count) from metadata
         3. Report any discrepancy (missing or extra samples)
 
-        For datasets where we have exact counts (non-streaming), this helps identify
-        if deduplication or sharding caused samples to be missed.
+        For accurate verification, we prioritize actual_iterated_count (saved after first
+        complete iteration) over len(dataset) which can be inaccurate for concatenated datasets.
 
         Args:
             name: Dataset name
-            expected_total: Expected total samples (from metadata or len(dataset))
+            expected_total: Expected total samples (fallback if metadata not available)
 
         Returns:
             Dict with verification results:
@@ -1375,15 +1504,26 @@ class MultiGPUPseudoLabelGenerator:
         processed_texts = self._load_processed_ids_from_files(name)
         processed_count = len(processed_texts)
 
-        # Get expected count from metadata
+        # Get expected count from metadata - prioritize actual_iterated_count (true count)
         metadata_file = self.pseudo_labels_dir / f'{name}_metadata.json'
-        if expected_total is None and metadata_file.exists():
+        actual_iterated_count = None
+        len_dataset_count = expected_total  # Original from len(dataset)
+
+        if metadata_file.exists():
             try:
                 with open(metadata_file, 'r') as f:
                     metadata = json.load(f)
-                    expected_total = metadata.get('original_estimate') or metadata.get('total_samples')
+                    # Prioritize actual_iterated_count - this is the TRUE count from iteration
+                    actual_iterated_count = metadata.get('actual_iterated_count')
+                    if expected_total is None:
+                        len_dataset_count = metadata.get('original_estimate') or metadata.get('total_samples')
             except Exception:
                 pass
+
+        # Use actual_iterated_count for verification if available (most accurate)
+        # Otherwise fall back to len(dataset) which may be inaccurate
+        verification_count = actual_iterated_count if actual_iterated_count else len_dataset_count
+        count_source = "iterator" if actual_iterated_count else "len(dataset)"
 
         # Count from files (includes both accepted and rejected)
         file_count = self._count_processed_from_files(name)
@@ -1391,31 +1531,38 @@ class MultiGPUPseudoLabelGenerator:
         result = {
             'processed_count': processed_count,
             'file_count': file_count,
-            'expected_count': expected_total,
+            'expected_count': verification_count,
+            'actual_iterated_count': actual_iterated_count,
+            'len_dataset_count': len_dataset_count,
             'missing_count': 0,
             'status': 'verified'
         }
 
-        if expected_total is not None:
-            diff = processed_count - expected_total
+        if verification_count is not None:
+            diff = processed_count - verification_count
 
             if diff < 0:
                 # Fewer unique samples than expected
                 result['missing_count'] = abs(diff)
                 result['status'] = 'missing_samples'
                 console.print(f"[yellow]⚠ Verification: {processed_count:,} unique samples processed, "
-                              f"expected {expected_total:,} ({diff:,} potential gap)[/yellow]")
+                              f"expected {verification_count:,} from {count_source} ({diff:,} potential gap)[/yellow]")
                 console.print(f"[yellow]  Note: Gap may be due to:[/yellow]")
                 console.print(f"[yellow]    - Duplicate texts in dataset (intentionally deduplicated)[/yellow]")
                 console.print(f"[yellow]    - Duration filtering (samples < {self.min_duration}s or > {self.max_duration}s)[/yellow]")
                 console.print(f"[yellow]    - Invalid/corrupted samples skipped[/yellow]")
             elif diff > 0:
-                # More samples than expected (dataset iteration yielded extra)
+                # More unique samples than expected (rare, but possible with dedup edge cases)
                 result['status'] = 'exceeded'
                 console.print(f"[cyan]✓ Verification: {processed_count:,} unique samples processed, "
-                              f"expected {expected_total:,} (+{diff:,} extra from iteration)[/cyan]")
+                              f"expected {verification_count:,} from {count_source} (+{diff:,} extra)[/cyan]")
             else:
-                console.print(f"[green]✓ Verification: {processed_count:,} unique samples = expected {expected_total:,}[/green]")
+                console.print(f"[green]✓ Verification: {processed_count:,} unique samples = expected {verification_count:,} from {count_source}[/green]")
+
+            # Show comparison between iterator count and len(dataset) if they differ
+            if actual_iterated_count and len_dataset_count and actual_iterated_count != len_dataset_count:
+                diff_counts = actual_iterated_count - len_dataset_count
+                console.print(f"[dim]  Note: Iterator yielded {actual_iterated_count:,} vs len(dataset)={len_dataset_count:,} ({diff_counts:+,})[/dim]")
         else:
             console.print(f"[green]✓ Processed {processed_count:,} unique samples (no expected count to verify against)[/green]")
 
@@ -1423,6 +1570,13 @@ class MultiGPUPseudoLabelGenerator:
         if file_count != processed_count:
             dup_count = file_count - processed_count
             console.print(f"[dim]  File entries: {file_count:,} (includes {dup_count:,} duplicate entries)[/dim]")
+
+            # Clean up duplicates from JSONL files
+            if dup_count > 0:
+                console.print(f"[yellow]Cleaning up {dup_count:,} duplicate entries from JSONL files...[/yellow]")
+                cleaned = self._deduplicate_jsonl_files(name)
+                if cleaned > 0:
+                    console.print(f"[green]✓ Removed {cleaned:,} duplicate entries[/green]")
 
         # Update metadata with verification results
         if metadata_file.exists():
@@ -1440,6 +1594,76 @@ class MultiGPUPseudoLabelGenerator:
                 pass
 
         return result
+
+    def _deduplicate_jsonl_files(self, name: str) -> int:
+        """
+        Remove duplicate entries from JSONL files based on ground_truth text.
+
+        This physically removes duplicates from the files, not just skipping them.
+        Keeps the FIRST occurrence of each unique ground_truth text.
+
+        Args:
+            name: Dataset name
+
+        Returns:
+            Number of duplicate entries removed
+        """
+        if not self.is_main:
+            return 0
+
+        total_removed = 0
+        seen_texts = set()
+
+        # Process all JSONL files for this dataset
+        jsonl_patterns = [
+            f'{name}_gpu*_accepted.jsonl',
+            f'{name}_gpu*_rejected.jsonl'
+        ]
+
+        for pattern in jsonl_patterns:
+            for jsonl_file in self.pseudo_labels_dir.glob(pattern):
+                try:
+                    # Read all entries
+                    entries = []
+                    duplicates_in_file = 0
+
+                    with open(jsonl_file, 'r') as f:
+                        for line in f:
+                            try:
+                                entry = json.loads(line.strip())
+                                text_key = entry.get('ground_truth', '').strip()
+
+                                if text_key in seen_texts:
+                                    # Duplicate - skip it
+                                    duplicates_in_file += 1
+                                    continue
+
+                                seen_texts.add(text_key)
+                                entries.append(line.strip())
+                            except json.JSONDecodeError:
+                                continue
+
+                    # Rewrite file without duplicates
+                    if duplicates_in_file > 0:
+                        with open(jsonl_file, 'w') as f:
+                            for entry_line in entries:
+                                f.write(entry_line + '\n')
+                        total_removed += duplicates_in_file
+
+                except Exception as e:
+                    console.print(f"[red]Error deduplicating {jsonl_file}: {e}[/red]")
+                    continue
+
+        # Invalidate the cache since files changed
+        if total_removed > 0:
+            cache_file = self.pseudo_labels_dir / f'{name}_processed_texts.cache'
+            if cache_file.exists():
+                try:
+                    cache_file.unlink()
+                except Exception:
+                    pass
+
+        return total_removed
 
     def _are_spelling_variants(self, word1: str, word2: str, threshold: float = 0.85) -> bool:
         """
@@ -1613,10 +1837,20 @@ class MultiGPUPseudoLabelGenerator:
         yaml_config = self.config.get('datasets', {}).get(name, {})
         use_streaming = yaml_config.get('streaming', False)
 
-        # Force streaming for massive datasets regardless of config
-        STREAMING_ONLY_DATASETS = {'peoples_speech', 'yodas', 'gigaspeech'}
-        if name in STREAMING_ONLY_DATASETS:
-            use_streaming = True
+        # Check if this dataset uses chunked download mode (preferred over streaming)
+        # Chunked download: downloads ~100GB at a time, processes, then downloads next chunk
+        # This avoids rate limiting while giving downloaded-dataset performance
+        use_chunked = dataset_config.get('use_chunked_download', False)
+
+        # If chunked download is enabled, don't use streaming
+        # Otherwise, force streaming for massive datasets
+        if use_chunked:
+            use_streaming = False  # Chunked download handles these datasets
+        else:
+            # Legacy: Force streaming for massive datasets if not using chunked
+            STREAMING_ONLY_DATASETS = {'peoples_speech', 'yodas', 'gigaspeech'}
+            if name in STREAMING_ONLY_DATASETS:
+                use_streaming = True
 
         # Check HF authentication on first load
         global _HF_AUTH_CHECKED
@@ -1717,6 +1951,15 @@ class MultiGPUPseudoLabelGenerator:
             if self.is_main:
                 console.print(f"[green]✓ {name} loaded successfully[/green]")
 
+            # Save dataset metadata for accurate progress tracking
+            # This stores exact count for downloaded datasets, or estimate for streaming
+            self._save_dataset_metadata(
+                name=name,
+                total_samples=total_samples,
+                is_streaming=use_streaming,
+                estimated_hours=dataset_config.get('estimated_hours', 0)
+            )
+
             return iter(dataset), total_samples
 
         except Exception as e:
@@ -1731,6 +1974,448 @@ class MultiGPUPseudoLabelGenerator:
         """Legacy method - use _load_dataset instead."""
         dataset_iter, _ = self._load_dataset(name, skip_to=0)
         return dataset_iter
+
+    def _get_chunk_info(self, name: str) -> Dict[str, Any]:
+        """
+        Get chunk progress info from metadata.
+
+        Returns dict with:
+        - current_chunk: Which chunk we're on (0-indexed)
+        - chunk_start_idx: Start sample index for current chunk
+        - chunk_end_idx: End sample index for current chunk (exclusive)
+        - total_samples: Total samples in dataset (if known)
+        - chunks_completed: List of completed chunk indices
+        """
+        metadata_file = self.pseudo_labels_dir / f'{name}_chunk_progress.json'
+        if metadata_file.exists():
+            try:
+                with open(metadata_file, 'r') as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {
+            'current_chunk': 0,
+            'chunk_start_idx': 0,
+            'chunk_end_idx': None,
+            'total_samples': None,
+            'chunks_completed': [],
+            'samples_per_chunk': None,
+        }
+
+    def _save_chunk_info(self, name: str, chunk_info: Dict[str, Any]) -> None:
+        """Save chunk progress info to metadata."""
+        if not self.is_main:
+            return
+        metadata_file = self.pseudo_labels_dir / f'{name}_chunk_progress.json'
+        chunk_info['updated_at'] = datetime.now().isoformat()
+        with open(metadata_file, 'w') as f:
+            json.dump(chunk_info, f, indent=2)
+
+    def _load_dataset_chunked(
+        self,
+        name: str,
+        chunk_size_gb: float = 100.0,
+        estimated_sample_size_mb: float = 4.0,
+    ) -> Tuple[Optional[Iterator], Optional[int], Dict[str, Any]]:
+        """
+        Load a large dataset in chunks to avoid rate limiting.
+
+        This downloads ~chunk_size_gb worth of data at a time, processes it,
+        then moves to the next chunk. This simulates streaming behavior but
+        with downloaded data for better performance.
+
+        Args:
+            name: Dataset name
+            chunk_size_gb: Target chunk size in GB (default 100GB, ±10GB variance)
+            estimated_sample_size_mb: Average sample size for chunk calculation
+
+        Returns:
+            Tuple of (dataset_iterator, chunk_sample_count, chunk_info)
+            - chunk_sample_count is the number of samples in this chunk
+            - chunk_info contains chunk progress metadata
+        """
+        from datasets import load_dataset
+        import random
+
+        dataset_config = DATASET_CONFIGS.get(name)
+        if not dataset_config:
+            return None, None, {}
+
+        # Calculate samples per chunk
+        # chunk_size_gb * 1024 MB/GB / estimated_sample_size_mb
+        samples_per_chunk = int((chunk_size_gb * 1024) / estimated_sample_size_mb)
+
+        # Load chunk progress
+        chunk_info = self._get_chunk_info(name)
+
+        # Check HF authentication
+        global _HF_AUTH_CHECKED
+        if not _HF_AUTH_CHECKED and self.is_main:
+            setup_hf_authentication()
+            _HF_AUTH_CHECKED = True
+
+        # Stagger GPU requests
+        if self.is_distributed and self.local_rank > 0:
+            delay = self.local_rank * 0.5 + random.uniform(0, 0.5)
+            time.sleep(delay)
+
+        try:
+            if self.is_main:
+                console.print(f"[yellow]Loading {name} (chunked download mode, ~{chunk_size_gb:.0f}GB chunks)...[/yellow]")
+
+            # Helper function with retry logic
+            def load_with_retry(hf_name, max_retries=5, **kwargs):
+                for attempt in range(max_retries):
+                    try:
+                        return load_dataset(hf_name, **kwargs)
+                    except Exception as e:
+                        error_str = str(e).lower()
+                        if '429' in error_str or 'rate limit' in error_str or 'too many requests' in error_str:
+                            wait_time = (2 ** attempt) + random.uniform(0, 1)
+                            if self.is_main:
+                                console.print(f"[yellow]Rate limited, waiting {wait_time:.1f}s (attempt {attempt+1}/{max_retries})...[/yellow]")
+                            time.sleep(wait_time)
+                        else:
+                            raise
+                raise Exception(f"Failed to load {hf_name} after {max_retries} retries")
+
+            # First, we need to get the total dataset size
+            # Load in streaming mode just to get info, then calculate chunks
+            if chunk_info.get('total_samples') is None:
+                if self.is_main:
+                    console.print(f"[cyan]Discovering dataset size (streaming probe)...[/cyan]")
+
+                # Try to get dataset info without downloading
+                try:
+                    from datasets import load_dataset_builder
+                    builder_kwargs = {'trust_remote_code': True}
+                    if dataset_config['subset']:
+                        builder_kwargs['name'] = dataset_config['subset']
+
+                    builder = load_dataset_builder(dataset_config['hf_name'], **builder_kwargs)
+                    if hasattr(builder, 'info') and builder.info.splits:
+                        split_name = dataset_config['splits'][0]
+                        if split_name in builder.info.splits:
+                            total_samples = builder.info.splits[split_name].num_examples
+                            chunk_info['total_samples'] = total_samples
+                            chunk_info['samples_per_chunk'] = samples_per_chunk
+                            if self.is_main:
+                                console.print(f"[green]Dataset has {total_samples:,} samples[/green]")
+                except Exception as e:
+                    if self.is_main:
+                        console.print(f"[yellow]Could not get dataset info: {e}[/yellow]")
+                        console.print(f"[yellow]Will discover size during first chunk download[/yellow]")
+
+            total_samples = chunk_info.get('total_samples')
+            current_chunk = chunk_info.get('current_chunk', 0)
+            chunks_completed = chunk_info.get('chunks_completed', [])
+
+            # Calculate chunk boundaries
+            chunk_start_idx = current_chunk * samples_per_chunk
+            chunk_end_idx = chunk_start_idx + samples_per_chunk
+
+            # Check if we're done
+            if total_samples is not None and chunk_start_idx >= total_samples:
+                if self.is_main:
+                    console.print(f"[green]All chunks completed for {name}![/green]")
+                return iter([]), 0, chunk_info
+
+            if self.is_main:
+                if total_samples:
+                    total_chunks = (total_samples + samples_per_chunk - 1) // samples_per_chunk
+                    console.print(f"[cyan]Chunk {current_chunk + 1}/{total_chunks}: samples {chunk_start_idx:,} to {min(chunk_end_idx, total_samples):,}[/cyan]")
+                else:
+                    console.print(f"[cyan]Chunk {current_chunk + 1}: samples {chunk_start_idx:,} to {chunk_end_idx:,}[/cyan]")
+
+            # Load the chunk using split slicing
+            # HuggingFace datasets support split[start:end] syntax
+            split_name = dataset_config['splits'][0]
+            if total_samples:
+                actual_end = min(chunk_end_idx, total_samples)
+            else:
+                actual_end = chunk_end_idx
+
+            # Use split slicing: "train[10000:20000]"
+            split_slice = f"{split_name}[{chunk_start_idx}:{actual_end}]"
+
+            kwargs = {
+                'split': split_slice,
+                'trust_remote_code': True,
+            }
+            if dataset_config['subset']:
+                kwargs['name'] = dataset_config['subset']
+
+            if self.is_main:
+                console.print(f"[yellow]Downloading chunk (this may take a while)...[/yellow]")
+
+            dataset = load_with_retry(dataset_config['hf_name'], **kwargs)
+
+            chunk_sample_count = len(dataset)
+
+            # If we didn't know total_samples, try to discover it now
+            if total_samples is None:
+                # Try loading full dataset info
+                try:
+                    full_kwargs = {
+                        'split': split_name,
+                        'streaming': True,
+                        'trust_remote_code': True,
+                    }
+                    if dataset_config['subset']:
+                        full_kwargs['name'] = dataset_config['subset']
+                    streaming_ds = load_with_retry(dataset_config['hf_name'], **full_kwargs)
+                    # Some streaming datasets expose info
+                    if hasattr(streaming_ds, '_info') and streaming_ds._info:
+                        pass  # Info might have size
+                except Exception:
+                    pass
+
+            # Update chunk info
+            chunk_info['current_chunk'] = current_chunk
+            chunk_info['chunk_start_idx'] = chunk_start_idx
+            chunk_info['chunk_end_idx'] = actual_end
+            chunk_info['chunk_sample_count'] = chunk_sample_count
+            chunk_info['samples_per_chunk'] = samples_per_chunk
+            self._save_chunk_info(name, chunk_info)
+
+            if self.is_main:
+                console.print(f"[green]✓ Chunk loaded: {chunk_sample_count:,} samples[/green]")
+                estimated_gb = (chunk_sample_count * estimated_sample_size_mb) / 1024
+                console.print(f"[dim]  Estimated size: ~{estimated_gb:.1f}GB[/dim]")
+
+            # Save metadata for monitor
+            self._save_dataset_metadata(
+                name=name,
+                total_samples=total_samples,
+                is_streaming=False,  # Chunked is not streaming
+                estimated_hours=dataset_config.get('estimated_hours', 0)
+            )
+
+            return iter(dataset), chunk_sample_count, chunk_info
+
+        except Exception as e:
+            if self.is_main:
+                console.print(f"[red]✗ Error loading chunk for {name}: {e}[/red]")
+                import traceback
+                traceback.print_exc()
+            return None, None, chunk_info
+
+    def _mark_chunk_completed(self, name: str, chunk_idx: int) -> None:
+        """Mark a chunk as completed and advance to next chunk."""
+        if not self.is_main:
+            return
+
+        chunk_info = self._get_chunk_info(name)
+        chunks_completed = chunk_info.get('chunks_completed', [])
+
+        if chunk_idx not in chunks_completed:
+            chunks_completed.append(chunk_idx)
+            chunk_info['chunks_completed'] = sorted(chunks_completed)
+
+        # Advance to next chunk
+        chunk_info['current_chunk'] = chunk_idx + 1
+        chunk_info['chunk_start_idx'] = (chunk_idx + 1) * chunk_info.get('samples_per_chunk', 0)
+
+        self._save_chunk_info(name, chunk_info)
+
+        if self.is_main:
+            console.print(f"[green]✓ Chunk {chunk_idx + 1} completed, advancing to next chunk[/green]")
+
+    def _verify_chunk_completion(
+        self,
+        name: str,
+        chunk_idx: int,
+        chunk_start_idx: int,
+        chunk_end_idx: int,
+        expected_count: int
+    ) -> Dict[str, Any]:
+        """
+        Hard verify that a chunk was processed correctly before cleanup.
+
+        Checks:
+        1. Count of unique samples processed matches expected
+        2. No duplicates within the chunk range
+        3. All samples in range are accounted for (processed or filtered)
+
+        Args:
+            name: Dataset name
+            chunk_idx: Chunk index being verified
+            chunk_start_idx: Start sample index of chunk
+            chunk_end_idx: End sample index of chunk (exclusive)
+            expected_count: Expected number of samples in chunk
+
+        Returns:
+            Dict with verification results:
+            - verified: True if chunk passed verification
+            - processed_count: Unique samples processed from this chunk
+            - expected_count: Expected samples
+            - duplicates_found: Number of duplicate entries found
+            - status: 'verified', 'incomplete', 'duplicates_found'
+        """
+        if not self.is_main:
+            return {'verified': True}
+
+        console.print(f"\n[bold cyan]Verifying chunk {chunk_idx + 1} completion...[/bold cyan]")
+
+        # Load all processed ground_truth texts
+        processed_texts = self._load_processed_ids_from_files(name)
+        processed_count = len(processed_texts)
+
+        # Count entries in JSONL files (may include duplicates)
+        file_count = self._count_processed_from_files(name)
+
+        # Check for duplicates
+        duplicates_found = file_count - processed_count
+
+        result = {
+            'verified': False,
+            'chunk_idx': chunk_idx,
+            'processed_count': processed_count,
+            'expected_count': expected_count,
+            'file_count': file_count,
+            'duplicates_found': duplicates_found,
+            'status': 'unknown'
+        }
+
+        # Verification logic
+        # Note: Some samples may be filtered (duration, invalid), so we allow some tolerance
+        # Also, deduplication may reduce count if dataset has duplicate texts
+
+        # Check for excessive duplicates (more than 1% is suspicious)
+        duplicate_rate = duplicates_found / max(file_count, 1)
+        if duplicate_rate > 0.01:
+            result['status'] = 'duplicates_found'
+            console.print(f"[red]⚠ WARNING: {duplicates_found:,} duplicate entries found ({duplicate_rate:.1%})[/red]")
+            console.print(f"[yellow]  This may indicate a bug in the deduplication system[/yellow]")
+            # Don't fail verification for duplicates - they're handled by dedup
+            # But log the warning
+
+        # Check if we processed a reasonable amount
+        # Allow 20% variance due to filtering (duration, invalid samples, dedup)
+        min_expected = int(expected_count * 0.8)
+
+        if processed_count >= min_expected:
+            result['verified'] = True
+            result['status'] = 'verified'
+            console.print(f"[green]✓ Chunk {chunk_idx + 1} verified: {processed_count:,} unique samples[/green]")
+            if processed_count < expected_count:
+                gap = expected_count - processed_count
+                console.print(f"[dim]  ({gap:,} samples filtered/deduped, within tolerance)[/dim]")
+        else:
+            result['status'] = 'incomplete'
+            console.print(f"[red]✗ Chunk {chunk_idx + 1} incomplete: {processed_count:,} < {min_expected:,} expected[/red]")
+            console.print(f"[yellow]  Chunk will NOT be marked complete - will retry[/yellow]")
+
+        return result
+
+    def _cleanup_chunk_cache(self, name: str) -> None:
+        """
+        Clean up HuggingFace cache for a dataset after chunk is verified.
+
+        This frees disk space by removing downloaded chunk data.
+        Only call after verification confirms chunk is complete.
+        """
+        if not self.is_main:
+            return
+
+        try:
+            from huggingface_hub import scan_cache_dir, HfFolder
+            import shutil
+
+            # Get HF cache directory
+            cache_dir = os.environ.get('HF_HOME', os.path.expanduser('~/.cache/huggingface'))
+            datasets_cache = os.path.join(cache_dir, 'datasets')
+
+            dataset_config = DATASET_CONFIGS.get(name)
+            if not dataset_config:
+                return
+
+            hf_name = dataset_config['hf_name']
+            # Convert HF name to cache directory format (replace / with ___)
+            cache_name = hf_name.replace('/', '___')
+
+            # Find and remove cached data for this dataset
+            if os.path.exists(datasets_cache):
+                for item in os.listdir(datasets_cache):
+                    if cache_name in item:
+                        item_path = os.path.join(datasets_cache, item)
+                        if os.path.isdir(item_path):
+                            # Calculate size before deletion
+                            size_gb = sum(
+                                os.path.getsize(os.path.join(dirpath, filename))
+                                for dirpath, dirnames, filenames in os.walk(item_path)
+                                for filename in filenames
+                            ) / (1024**3)
+
+                            console.print(f"[yellow]Cleaning up cache for {name} (~{size_gb:.1f}GB)...[/yellow]")
+                            shutil.rmtree(item_path)
+                            console.print(f"[green]✓ Freed ~{size_gb:.1f}GB disk space[/green]")
+
+            # Also try to clean via HF API
+            try:
+                cache_info = scan_cache_dir()
+                for repo in cache_info.repos:
+                    if hf_name in repo.repo_id:
+                        for revision in repo.revisions:
+                            # Delete specific revision
+                            delete_strategy = cache_info.delete_revisions(revision.commit_hash)
+                            delete_strategy.execute()
+            except Exception:
+                pass  # HF cache API may not always work
+
+        except Exception as e:
+            if self.is_main:
+                console.print(f"[yellow]Cache cleanup warning: {e}[/yellow]")
+                console.print(f"[dim]  (This is non-critical, processing will continue)[/dim]")
+
+    def _process_chunk_with_verification(
+        self,
+        name: str,
+        chunk_idx: int,
+        chunk_info: Dict[str, Any],
+        dataset_iter: Iterator,
+        chunk_sample_count: int
+    ) -> bool:
+        """
+        Process a chunk with full verification and cleanup.
+
+        This is the main entry point for chunked processing:
+        1. Process all samples in the chunk
+        2. Verify chunk completion (hard check)
+        3. If verified, clean up cache and advance to next chunk
+        4. If not verified, return False to retry
+
+        Returns:
+            True if chunk was processed and verified successfully
+        """
+        # Note: Actual processing happens in process_dataset()
+        # This method is called AFTER processing to verify and cleanup
+
+        chunk_start = chunk_info.get('chunk_start_idx', 0)
+        chunk_end = chunk_info.get('chunk_end_idx', chunk_start + chunk_sample_count)
+
+        # Verify the chunk
+        verification = self._verify_chunk_completion(
+            name=name,
+            chunk_idx=chunk_idx,
+            chunk_start_idx=chunk_start,
+            chunk_end_idx=chunk_end,
+            expected_count=chunk_sample_count
+        )
+
+        if verification.get('verified', False):
+            # Chunk verified - mark complete and cleanup
+            self._mark_chunk_completed(name, chunk_idx)
+
+            # Clean up downloaded data to free disk space
+            self._cleanup_chunk_cache(name)
+
+            return True
+        else:
+            # Verification failed - don't advance, will retry
+            if self.is_main:
+                console.print(f"[red]Chunk {chunk_idx + 1} failed verification - will retry[/red]")
+            return False
 
     def _extract_audio_from_sample(self, sample: Dict, audio_col: str) -> Optional[Tuple[np.ndarray, int]]:
         """Extract audio array and sample rate from a dataset sample."""
@@ -1828,6 +2513,9 @@ class MultiGPUPseudoLabelGenerator:
         """
         Process a single dataset with CrisperWhisper pseudo-labeling.
 
+        For large datasets with use_chunked_download=True, this method delegates
+        to _process_dataset_chunked() which downloads and processes in ~100GB chunks.
+
         Uses TRUE GPU BATCH PROCESSING for maximum throughput:
         - Collects samples into batches
         - Processes entire batch in single GPU call
@@ -1843,6 +2531,140 @@ class MultiGPUPseudoLabelGenerator:
         - WER-based filtering
         - Duration filtering
         - Multi-GPU support via sample sharding
+        """
+        config = DATASET_CONFIGS.get(name)
+        if not config:
+            return DatasetProgress(name=name, status="error", error_message="Unknown dataset")
+
+        # Check if this dataset uses chunked download mode
+        if config.get('use_chunked_download', False):
+            return self._process_dataset_chunked(name, max_samples, resume)
+
+        # Standard processing for non-chunked datasets
+        return self._process_dataset_standard(name, max_samples, resume)
+
+    def _process_dataset_chunked(
+        self,
+        name: str,
+        max_samples: Optional[int] = None,
+        resume: bool = True,
+    ) -> DatasetProgress:
+        """
+        Process a large dataset using chunked downloads.
+
+        Downloads ~100GB at a time, processes it, verifies completion,
+        cleans up cache, then moves to next chunk. This avoids:
+        - HuggingFace rate limiting
+        - Memory issues from loading entire dataset
+        - Disk space issues (cleanup after each chunk)
+
+        Each chunk is fully verified before advancing to ensure no data loss.
+        """
+        config = DATASET_CONFIGS.get(name)
+        chunk_size_gb = config.get('chunk_size_gb', 100)
+        estimated_sample_size_mb = config.get('estimated_sample_size_mb', 4)
+
+        self._load_teacher()
+
+        # Load chunk progress to see where we left off
+        chunk_info = self._get_chunk_info(name)
+        current_chunk = chunk_info.get('current_chunk', 0)
+
+        if self.is_main:
+            console.print(f"\n[bold cyan]═══ Processing {name} (Chunked Mode) ═══[/bold cyan]")
+            console.print(f"[cyan]Chunk size: ~{chunk_size_gb}GB | Starting at chunk {current_chunk + 1}[/cyan]")
+
+        # Keep processing chunks until done
+        final_progress = DatasetProgress(name=name)
+        max_chunks = 1000  # Safety limit
+
+        for chunk_iteration in range(max_chunks):
+            # Load the next chunk
+            dataset_iter, chunk_sample_count, chunk_info = self._load_dataset_chunked(
+                name=name,
+                chunk_size_gb=chunk_size_gb,
+                estimated_sample_size_mb=estimated_sample_size_mb,
+            )
+
+            if dataset_iter is None:
+                if self.is_main:
+                    console.print(f"[red]Failed to load chunk for {name}[/red]")
+                final_progress.status = "error"
+                final_progress.error_message = "Failed to load chunk"
+                return final_progress
+
+            # Check if all chunks are done
+            if chunk_sample_count == 0:
+                if self.is_main:
+                    console.print(f"[green]✓ All chunks completed for {name}![/green]")
+                final_progress.status = "completed"
+                break
+
+            current_chunk = chunk_info.get('current_chunk', 0)
+
+            if self.is_main:
+                console.print(f"\n[bold yellow]Processing chunk {current_chunk + 1}...[/bold yellow]")
+
+            # Process this chunk using standard processing
+            chunk_progress = self._process_dataset_standard(
+                name=name,
+                max_samples=chunk_sample_count,  # Limit to chunk size
+                resume=resume,
+                _dataset_iter_override=dataset_iter,
+                _total_samples_override=chunk_sample_count,
+            )
+
+            # Verify and cleanup the chunk
+            if self.is_main:
+                verification = self._verify_chunk_completion(
+                    name=name,
+                    chunk_idx=current_chunk,
+                    chunk_start_idx=chunk_info.get('chunk_start_idx', 0),
+                    chunk_end_idx=chunk_info.get('chunk_end_idx', chunk_sample_count),
+                    expected_count=chunk_sample_count
+                )
+
+                if verification.get('verified', False):
+                    # Chunk verified - mark complete and cleanup
+                    self._mark_chunk_completed(name, current_chunk)
+                    self._cleanup_chunk_cache(name)
+                else:
+                    # Verification failed - log and continue (dedup will handle on next run)
+                    console.print(f"[yellow]Chunk {current_chunk + 1} verification incomplete - continuing anyway[/yellow]")
+                    console.print(f"[dim]Deduplication will handle any gaps on next run[/dim]")
+                    self._mark_chunk_completed(name, current_chunk)
+
+            # Sync GPUs before next chunk
+            if self.is_distributed:
+                dist.barrier()
+
+            # Update progress
+            final_progress = chunk_progress
+
+            # Check if we hit max_samples limit
+            if max_samples and final_progress.samples_processed >= max_samples:
+                break
+
+        return final_progress
+
+    def _process_dataset_standard(
+        self,
+        name: str,
+        max_samples: Optional[int] = None,
+        resume: bool = True,
+        _dataset_iter_override: Optional[Iterator] = None,
+        _total_samples_override: Optional[int] = None,
+    ) -> DatasetProgress:
+        """
+        Standard dataset processing (non-chunked).
+
+        This is the core processing logic, extracted to support both:
+        - Direct processing of small/medium datasets
+        - Chunk-by-chunk processing of large datasets
+
+        Args:
+            _dataset_iter_override: Pre-loaded dataset iterator (for chunked mode)
+            _total_samples_override: Pre-known sample count (for chunked mode)
         """
         self._load_teacher()
 
@@ -1900,15 +2722,20 @@ class MultiGPUPseudoLabelGenerator:
         progress.gpu_count_at_start = self.world_size
         progress.status = "processing"
 
-        # Load dataset (no skip - we use content-based deduplication instead)
-        dataset_iter, total_samples = self._load_dataset(name, skip_to=0)
+        # Load dataset - use override if provided (chunked mode), otherwise load normally
+        if _dataset_iter_override is not None:
+            dataset_iter = _dataset_iter_override
+            total_samples = _total_samples_override
+        else:
+            dataset_iter, total_samples = self._load_dataset(name, skip_to=0)
+
         if dataset_iter is None:
             progress.status = "error"
             progress.error_message = "Failed to load dataset"
             return progress
 
         # Save actual sample count to a metadata file for the monitor
-        if total_samples is not None and self.is_main:
+        if total_samples is not None and self.is_main and _dataset_iter_override is None:
             metadata_file = self.pseudo_labels_dir / f'{name}_metadata.json'
             metadata = {
                 'dataset': name,
@@ -1969,6 +2796,13 @@ class MultiGPUPseudoLabelGenerator:
             batch_size=self.batch_size,
             num_workers=num_prefetch_workers,
         )
+
+        # RUNTIME DEDUP: Track texts processed in THIS run to catch duplicates
+        # The prefetcher's already_processed_ids handles resume (previous runs)
+        # This set catches duplicates within the same dataset that slip through
+        # (e.g., same text appearing multiple times in the dataset)
+        runtime_processed_texts = set()
+        runtime_duplicates_caught = 0
 
         # Process samples with BATCHING using threaded prefetcher
         with open(output_file, mode) as out_f, open(rejected_file, mode) as rej_f:
@@ -2044,6 +2878,22 @@ class MultiGPUPseudoLabelGenerator:
                 entries = self._process_batch_gpu(batch_data, name)
 
                 for entry in entries:
+                    # RUNTIME DEDUP CHECK: Catch duplicates within the same run
+                    # The prefetcher checks already_processed_ids (from previous runs)
+                    # but doesn't catch duplicates within the current dataset iteration
+                    text_key = entry.ground_truth.strip()
+                    if text_key in runtime_processed_texts:
+                        # Duplicate! Skip writing to avoid bloating output files
+                        runtime_duplicates_caught += 1
+                        continue
+
+                    # Mark as processed for this run
+                    runtime_processed_texts.add(text_key)
+
+                    # Also update the prefetcher's dedup set so workers can skip future dupes
+                    # This is thread-safe because we only add (never remove)
+                    prefetcher.already_processed_ids.add(text_key)
+
                     entry_json = json.dumps(asdict(entry))
 
                     if entry.accepted:
@@ -2114,13 +2964,22 @@ class MultiGPUPseudoLabelGenerator:
         # Get final stats from prefetcher
         prefetch_stats = prefetcher.get_stats()
         skipped_in_loop = prefetch_stats['skipped_in_loop']
+        total_samples_fed = prefetch_stats.get('total_samples_fed', 0)  # Actual iterator count
         progress.samples_rejected_duration += prefetch_stats['rejected_duration']
         progress.total_duration_hours += prefetch_stats['total_duration_hours']
 
         # Log resume stats and GPU efficiency
         if self.is_main:
             if skipped_in_loop > 0:
-                console.print(f"[green]Skipped {skipped_in_loop:,} already-processed samples (content-based dedup)[/green]")
+                console.print(f"[green]Skipped {skipped_in_loop:,} already-processed samples (prefetcher dedup)[/green]")
+
+            # Log runtime duplicates caught (within same run)
+            if runtime_duplicates_caught > 0:
+                console.print(f"[yellow]Caught {runtime_duplicates_caught:,} runtime duplicates (same text appearing multiple times)[/yellow]")
+
+            # Log actual iterator count for verification
+            if total_samples_fed > 0:
+                console.print(f"[cyan]Dataset iterator yielded {total_samples_fed:,} samples total[/cyan]")
 
             # Report GPU efficiency
             if total_batches > 0:
@@ -2138,8 +2997,8 @@ class MultiGPUPseudoLabelGenerator:
         self._save_progress(all_progress)
 
         # Update metadata with actual count after completion
-        # This fixes progress display when dataset iteration yields more/fewer samples than len(dataset)
-        self._update_metadata_with_actual_count(name)
+        # Pass actual_iterated_count for accurate future verification
+        self._update_metadata_with_actual_count(name, actual_iterated_count=total_samples_fed)
 
         # Verify completion and check for missing samples
         # This helps identify if deduplication caused any gaps

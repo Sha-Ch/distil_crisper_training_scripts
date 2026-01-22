@@ -150,13 +150,12 @@ def load_actual_sample_counts(pseudo_labels_dir: Path) -> dict:
     Load ACTUAL sample counts from metadata files created by processing script.
 
     The processing script saves {dataset}_metadata.json with counts:
-    - Initially: from len(dataset) when loading
-    - After completion: updated to actual processed count
+    - 'downloaded_exact': Exact count from len(dataset) when downloaded
+    - 'actual_processed': Verified count from completed processing
+    - 'estimated': Rough estimate for streaming datasets (based on hours)
+    - 'previous_completion': Using count from a previous completed run
 
-    The 'source' field indicates the reliability:
-    - 'actual_count': initial estimate from len(dataset)
-    - 'actual_processed': verified count from completed processing (most accurate)
-    - 'completed': true if processing finished and count is verified
+    The 'count_verified' field indicates if the count is exact (True) or estimated (False).
     """
     actual_counts = {}
 
@@ -170,19 +169,43 @@ def load_actual_sample_counts(pseudo_labels_dir: Path) -> dict:
                 name = metadata.get('dataset')
                 total = metadata.get('total_samples')
                 if name and total:
-                    source = metadata.get('source', 'actual')
-                    # Mark as verified if the count was updated after processing
+                    source = metadata.get('source', 'unknown')
+                    is_streaming = metadata.get('is_streaming', False)
+                    count_verified = metadata.get('count_verified', False)
+
+                    # Determine display source
                     if source == 'actual_processed' or metadata.get('completed', False):
-                        source = 'verified'
+                        display_source = 'verified'
+                    elif source == 'downloaded_exact':
+                        display_source = 'exact'
+                    elif source == 'estimated':
+                        display_source = 'estimate'
+                    elif source == 'previous_completion':
+                        display_source = 'previous'
+                    else:
+                        display_source = source
+
+                    # actual_iterated_count is the TRUE count from dataset iterator
+                    # This is more accurate than len(dataset) for concatenated datasets
+                    actual_iterated_count = metadata.get('actual_iterated_count')
+
+                    # For progress tracking, prefer actual_iterated_count (verified iterator total)
+                    # over total_samples (which may be from len(dataset) or processed count)
+                    best_total = actual_iterated_count if actual_iterated_count else total
+
                     actual_counts[name] = {
-                        'samples': total,
-                        'source': source,
-                        'hours': DATASET_ESTIMATES.get(name, {}).get('hours', 0),
+                        'samples': best_total,  # Use verified iterator count when available
+                        'source': display_source,
+                        'is_streaming': is_streaming,
+                        'count_verified': count_verified or (actual_iterated_count is not None),
+                        'hours': metadata.get('estimated_hours', DATASET_ESTIMATES.get(name, {}).get('hours', 0)),
                         'completed': metadata.get('completed', False),
                         'verified': metadata.get('verified', False),
                         'verification_status': metadata.get('verification_status', ''),
                         'unique_samples': metadata.get('unique_samples', total),
-                        'original_estimate': metadata.get('original_estimate', total)
+                        'original_estimate': metadata.get('original_estimate', total),
+                        'actual_iterated_count': actual_iterated_count,
+                        'processed_count': total,  # Keep original processed count too
                     }
         except Exception:
             continue
