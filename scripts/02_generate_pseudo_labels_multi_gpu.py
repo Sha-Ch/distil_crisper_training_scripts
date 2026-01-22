@@ -1367,9 +1367,9 @@ class MultiGPUPseudoLabelGenerator:
         if filtered_count > 0:
             console.print(f"[dim]  {processed_count:,} processed, {filtered_count:,} filtered/deduped[/dim]")
         else:
-            console.print(f"[green]Verified {name} metadata: {actual_count:,} samples[/green]")
+            console.print(f"[green]Verified {name} metadata: {processed_count:,} samples[/green]")
 
-        return actual_count
+        return processed_count
 
     def _save_dataset_metadata(
         self,
@@ -1500,9 +1500,23 @@ class MultiGPUPseudoLabelGenerator:
 
         console.print(f"\n[bold cyan]Verifying {name} completion...[/bold cyan]")
 
-        # Count unique processed samples by ground_truth text
+        # STEP 1: Clean up duplicates FIRST before counting
+        # This ensures accurate counts for verification
+        file_count_before = self._count_processed_from_files(name)
+        processed_texts_before = self._load_processed_ids_from_files(name)
+        unique_count_before = len(processed_texts_before)
+
+        if file_count_before != unique_count_before:
+            dup_count = file_count_before - unique_count_before
+            console.print(f"[yellow]Found {dup_count:,} duplicate entries in files, cleaning up...[/yellow]")
+            cleaned = self._deduplicate_jsonl_files(name)
+            if cleaned > 0:
+                console.print(f"[green]✓ Removed {cleaned:,} duplicate entries[/green]")
+
+        # STEP 2: Now count after deduplication (reload to get fresh counts)
         processed_texts = self._load_processed_ids_from_files(name)
         processed_count = len(processed_texts)
+        file_count = self._count_processed_from_files(name)
 
         # Get expected count from metadata - prioritize actual_iterated_count (true count)
         metadata_file = self.pseudo_labels_dir / f'{name}_metadata.json'
@@ -1525,9 +1539,6 @@ class MultiGPUPseudoLabelGenerator:
         verification_count = actual_iterated_count if actual_iterated_count else len_dataset_count
         count_source = "iterator" if actual_iterated_count else "len(dataset)"
 
-        # Count from files (includes both accepted and rejected)
-        file_count = self._count_processed_from_files(name)
-
         result = {
             'processed_count': processed_count,
             'file_count': file_count,
@@ -1538,6 +1549,7 @@ class MultiGPUPseudoLabelGenerator:
             'status': 'verified'
         }
 
+        # STEP 3: Determine verification status based on clean counts
         if verification_count is not None:
             diff = processed_count - verification_count
 
@@ -1566,17 +1578,9 @@ class MultiGPUPseudoLabelGenerator:
         else:
             console.print(f"[green]✓ Processed {processed_count:,} unique samples (no expected count to verify against)[/green]")
 
-        # Also report file count vs unique count (shows duplicates removed)
+        # Report final file count (should match unique count after dedup)
         if file_count != processed_count:
-            dup_count = file_count - processed_count
-            console.print(f"[dim]  File entries: {file_count:,} (includes {dup_count:,} duplicate entries)[/dim]")
-
-            # Clean up duplicates from JSONL files
-            if dup_count > 0:
-                console.print(f"[yellow]Cleaning up {dup_count:,} duplicate entries from JSONL files...[/yellow]")
-                cleaned = self._deduplicate_jsonl_files(name)
-                if cleaned > 0:
-                    console.print(f"[green]✓ Removed {cleaned:,} duplicate entries[/green]")
+            console.print(f"[dim]  File entries: {file_count:,} (unique: {processed_count:,})[/dim]")
 
         # Update metadata with verification results
         if metadata_file.exists():
@@ -3055,27 +3059,48 @@ class MultiGPUPseudoLabelGenerator:
 
             # SKIP ALREADY COMPLETED DATASETS
             # This prevents re-iterating through completed datasets on resume
+            # BUT: Don't skip if verification found missing samples - need to reprocess
             if resume and name in saved_progress:
                 existing = saved_progress[name]
                 if isinstance(existing, dict):
                     status = existing.get('status', 'pending')
+                    verification_status = existing.get('verification_status', '')
                 else:
                     status = getattr(existing, 'status', 'pending')
+                    verification_status = getattr(existing, 'verification_status', '')
+
+                # Also check metadata file for verification_status (more up-to-date)
+                metadata_file = self.pseudo_labels_dir / f'{name}_metadata.json'
+                if metadata_file.exists():
+                    try:
+                        with open(metadata_file, 'r') as f:
+                            metadata = json.load(f)
+                            verification_status = metadata.get('verification_status', verification_status)
+                    except Exception:
+                        pass
 
                 if status == 'completed':
-                    if self.is_main:
-                        console.print(f"\n[bold green]{'═' * 50}[/bold green]")
-                        console.print(f"[bold green]  Skipping {name} (already completed)[/bold green]")
-                        console.print(f"[bold green]{'═' * 50}[/bold green]")
-                    # Restore progress for summary
-                    if isinstance(existing, dict):
-                        all_progress[name] = DatasetProgress(**existing)
+                    # Check if we need to reprocess due to missing samples
+                    if verification_status == 'missing_samples':
+                        if self.is_main:
+                            console.print(f"\n[bold yellow]{'═' * 50}[/bold yellow]")
+                            console.print(f"[bold yellow]  {name} has missing samples - reprocessing[/bold yellow]")
+                            console.print(f"[bold yellow]{'═' * 50}[/bold yellow]")
+                        # Don't skip - fall through to process_dataset
                     else:
-                        all_progress[name] = existing
-                    # IMPORTANT: Still need to sync with other GPUs to prevent deadlock
-                    if self.is_distributed:
-                        dist.barrier()
-                    continue
+                        if self.is_main:
+                            console.print(f"\n[bold green]{'═' * 50}[/bold green]")
+                            console.print(f"[bold green]  Skipping {name} (already completed)[/bold green]")
+                            console.print(f"[bold green]{'═' * 50}[/bold green]")
+                        # Restore progress for summary
+                        if isinstance(existing, dict):
+                            all_progress[name] = DatasetProgress(**existing)
+                        else:
+                            all_progress[name] = existing
+                        # IMPORTANT: Still need to sync with other GPUs to prevent deadlock
+                        if self.is_distributed:
+                            dist.barrier()
+                        continue
 
             if self.is_main:
                 console.print(f"\n[bold cyan]{'═' * 50}[/bold cyan]")
