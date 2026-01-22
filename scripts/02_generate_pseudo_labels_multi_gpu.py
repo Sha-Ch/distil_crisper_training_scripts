@@ -177,20 +177,7 @@ DATASET_CONFIGS = {
         'quality': 'high',
     },
 
-    # Priority 4: Large scale, diverse (GigaSpeech)
-    'gigaspeech': {
-        'hf_name': 'speechcolab/gigaspeech',
-        'subset': 'xl',  # Full 10,000 hours
-        'splits': ['train'],
-        'text_column': 'text',
-        'audio_column': 'audio',
-        'estimated_hours': 10000,
-        'requires_auth': True,
-        'priority': 4,
-        'quality': 'high',
-    },
-
-    # Priority 5: European Parliament - formal speech (VoxPopuli)
+    # Priority 4: European Parliament - formal speech (VoxPopuli)
     'voxpopuli': {
         'hf_name': 'facebook/voxpopuli',
         'subset': 'en',
@@ -199,11 +186,11 @@ DATASET_CONFIGS = {
         'audio_column': 'audio',
         'estimated_hours': 1800,
         'requires_auth': False,
-        'priority': 5,
+        'priority': 4,
         'quality': 'high',
     },
 
-    # Priority 6: Crowdsourced - diverse speakers (Common Voice)
+    # Priority 5: Crowdsourced - diverse speakers (Common Voice)
     'common_voice': {
         'hf_name': 'mozilla-foundation/common_voice_17_0',
         'subset': 'en',
@@ -212,11 +199,11 @@ DATASET_CONFIGS = {
         'audio_column': 'audio',
         'estimated_hours': 3000,
         'requires_auth': True,
-        'priority': 6,
+        'priority': 5,
         'quality': 'medium',
     },
 
-    # Priority 7: TED talks - clear speech (TED-LIUM)
+    # Priority 6: TED talks - clear speech (TED-LIUM)
     'tedlium': {
         'hf_name': 'LIUM/tedlium',
         'subset': 'release3',
@@ -225,11 +212,28 @@ DATASET_CONFIGS = {
         'audio_column': 'audio',
         'estimated_hours': 450,
         'requires_auth': False,
+        'priority': 6,
+        'quality': 'high',
+    },
+
+    # =========================================================================
+    # STREAMING DATASETS (large, processed last)
+    # =========================================================================
+
+    # Priority 7: Large scale, diverse (GigaSpeech) - STREAMING
+    'gigaspeech': {
+        'hf_name': 'speechcolab/gigaspeech',
+        'subset': 'xl',  # Full 10,000 hours
+        'splits': ['train'],
+        'text_column': 'text',
+        'audio_column': 'audio',
+        'estimated_hours': 10000,
+        'requires_auth': True,
         'priority': 7,
         'quality': 'high',
     },
 
-    # Priority 8: Large scale diverse (People's Speech)
+    # Priority 8: Large scale diverse (People's Speech) - STREAMING
     'peoples_speech': {
         'hf_name': 'MLCommons/peoples_speech',
         'subset': 'clean',
@@ -242,7 +246,7 @@ DATASET_CONFIGS = {
         'quality': 'medium',
     },
 
-    # Priority 9: Massive YouTube dataset - bulk of data (YODAS)
+    # Priority 9: Massive YouTube dataset - bulk of data (YODAS) - STREAMING
     'yodas': {
         'hf_name': 'espnet/yodas',
         'subset': 'en000',
@@ -1265,12 +1269,29 @@ class MultiGPUPseudoLabelGenerator:
             return 1.0
 
     def _normalize_text(self, text: str) -> str:
-        """Normalize text for WER calculation."""
+        """Normalize text for WER calculation.
+
+        Strips filler words so CrisperWhisper's verbatim transcription
+        (with um, uh, etc.) doesn't get penalized when ground truth
+        doesn't include them.
+
+        CrisperWhisper outputs fillers in brackets like [Um], [Uh], etc.
+        """
         if not text:
             return ""
+
+        # Remove bracketed fillers first (CrisperWhisper format: [Um], [Uh], etc.)
+        text = re.sub(r'\[(?:um|uh|er|ah|uhm|erm|hmm|hm|mm|mhm)\]', '', text, flags=re.IGNORECASE)
+
         text = text.lower()
-        text = re.sub(r'[^\w\s\']', '', text)
-        text = ' '.join(text.split())
+        text = re.sub(r'[^\w\s\']', '', text)  # Remove punctuation except apostrophes
+
+        # Strip standalone filler words (in case they appear without brackets)
+        FILLER_WORDS = {'um', 'uh', 'er', 'ah', 'uhm', 'erm', 'hmm', 'hm', 'mm', 'mhm'}
+        words = text.split()
+        words = [w for w in words if w not in FILLER_WORDS]
+
+        text = ' '.join(words)
         return text
 
     def _load_dataset(self, name: str, skip_to: int = 0) -> Tuple[Optional[Iterator], Optional[int]]:
@@ -1298,7 +1319,7 @@ class MultiGPUPseudoLabelGenerator:
         use_streaming = yaml_config.get('streaming', False)
 
         # Force streaming for massive datasets regardless of config
-        STREAMING_ONLY_DATASETS = {'peoples_speech', 'yodas'}
+        STREAMING_ONLY_DATASETS = {'peoples_speech', 'yodas', 'gigaspeech'}
         if name in STREAMING_ONLY_DATASETS:
             use_streaming = True
 
