@@ -309,6 +309,8 @@ class DatasetProgress:
     # Track which GPUs contributed (for diagnostics)
     gpu_count_at_start: int = 1
     processed_sample_ids: List[str] = field(default_factory=list)  # For exact resume
+    # Verification status after completion
+    verification_status: str = ""  # verified, missing_samples, exceeded
 
     @property
     def acceptance_rate(self) -> float:
@@ -1267,6 +1269,162 @@ class MultiGPUPseudoLabelGenerator:
             # Progress is saved incrementally, just log
             console.print("[green]Progress already saved incrementally[/green]")
 
+    def _update_metadata_with_actual_count(self, name: str) -> int:
+        """
+        Update the metadata file with the ACTUAL processed count after completion.
+
+        This fixes the issue where the initial metadata (from len(dataset)) may differ
+        from the actual number of samples yielded during iteration. HuggingFace datasets
+        can sometimes yield slightly more samples than len() reports, especially when
+        concatenating multiple splits.
+
+        The metadata file is used by the monitor for progress display. Updating it
+        with the actual count ensures future runs show accurate progress.
+
+        Args:
+            name: Dataset name
+
+        Returns:
+            The actual count from files
+        """
+        if not self.is_main:
+            return 0
+
+        actual_count = self._count_processed_from_files(name)
+        metadata_file = self.pseudo_labels_dir / f'{name}_metadata.json'
+
+        # Read existing metadata or create new
+        if metadata_file.exists():
+            try:
+                with open(metadata_file, 'r') as f:
+                    metadata = json.load(f)
+            except Exception:
+                metadata = {'dataset': name}
+        else:
+            metadata = {'dataset': name}
+
+        original_count = metadata.get('total_samples', 0)
+
+        # Update with actual count
+        metadata['total_samples'] = actual_count
+        metadata['source'] = 'actual_processed'  # Mark as verified count
+        metadata['original_estimate'] = original_count  # Keep original for reference
+        metadata['updated_at'] = datetime.now().isoformat()
+        metadata['completed'] = True  # Mark as completed
+
+        with open(metadata_file, 'w') as f:
+            json.dump(metadata, f, indent=2)
+
+        if actual_count != original_count:
+            console.print(f"[cyan]Updated {name} metadata: {original_count:,} → {actual_count:,} samples "
+                          f"(diff: {actual_count - original_count:+,})[/cyan]")
+        else:
+            console.print(f"[green]Verified {name} metadata: {actual_count:,} samples[/green]")
+
+        return actual_count
+
+    def _verify_and_fill_missing_samples(
+        self,
+        name: str,
+        expected_total: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """
+        Verify dataset completion and identify any missing samples.
+
+        This runs after initial processing to:
+        1. Count unique samples processed (by ground_truth text)
+        2. Compare against expected total from metadata
+        3. Report any discrepancy (missing or extra samples)
+
+        For datasets where we have exact counts (non-streaming), this helps identify
+        if deduplication or sharding caused samples to be missed.
+
+        Args:
+            name: Dataset name
+            expected_total: Expected total samples (from metadata or len(dataset))
+
+        Returns:
+            Dict with verification results:
+            - 'processed_count': Number of unique samples processed
+            - 'expected_count': Expected total (if known)
+            - 'missing_count': Number potentially missing (expected - processed)
+            - 'status': 'verified', 'missing_samples', or 'exceeded'
+        """
+        if not self.is_main:
+            return {}
+
+        console.print(f"\n[bold cyan]Verifying {name} completion...[/bold cyan]")
+
+        # Count unique processed samples by ground_truth text
+        processed_texts = self._load_processed_ids_from_files(name)
+        processed_count = len(processed_texts)
+
+        # Get expected count from metadata
+        metadata_file = self.pseudo_labels_dir / f'{name}_metadata.json'
+        if expected_total is None and metadata_file.exists():
+            try:
+                with open(metadata_file, 'r') as f:
+                    metadata = json.load(f)
+                    expected_total = metadata.get('original_estimate') or metadata.get('total_samples')
+            except Exception:
+                pass
+
+        # Count from files (includes both accepted and rejected)
+        file_count = self._count_processed_from_files(name)
+
+        result = {
+            'processed_count': processed_count,
+            'file_count': file_count,
+            'expected_count': expected_total,
+            'missing_count': 0,
+            'status': 'verified'
+        }
+
+        if expected_total is not None:
+            diff = processed_count - expected_total
+
+            if diff < 0:
+                # Fewer unique samples than expected
+                result['missing_count'] = abs(diff)
+                result['status'] = 'missing_samples'
+                console.print(f"[yellow]⚠ Verification: {processed_count:,} unique samples processed, "
+                              f"expected {expected_total:,} ({diff:,} potential gap)[/yellow]")
+                console.print(f"[yellow]  Note: Gap may be due to:[/yellow]")
+                console.print(f"[yellow]    - Duplicate texts in dataset (intentionally deduplicated)[/yellow]")
+                console.print(f"[yellow]    - Duration filtering (samples < {self.min_duration}s or > {self.max_duration}s)[/yellow]")
+                console.print(f"[yellow]    - Invalid/corrupted samples skipped[/yellow]")
+            elif diff > 0:
+                # More samples than expected (dataset iteration yielded extra)
+                result['status'] = 'exceeded'
+                console.print(f"[cyan]✓ Verification: {processed_count:,} unique samples processed, "
+                              f"expected {expected_total:,} (+{diff:,} extra from iteration)[/cyan]")
+            else:
+                console.print(f"[green]✓ Verification: {processed_count:,} unique samples = expected {expected_total:,}[/green]")
+        else:
+            console.print(f"[green]✓ Processed {processed_count:,} unique samples (no expected count to verify against)[/green]")
+
+        # Also report file count vs unique count (shows duplicates removed)
+        if file_count != processed_count:
+            dup_count = file_count - processed_count
+            console.print(f"[dim]  File entries: {file_count:,} (includes {dup_count:,} duplicate entries)[/dim]")
+
+        # Update metadata with verification results
+        if metadata_file.exists():
+            try:
+                with open(metadata_file, 'r') as f:
+                    metadata = json.load(f)
+                metadata['verified'] = True
+                metadata['verified_at'] = datetime.now().isoformat()
+                metadata['unique_samples'] = processed_count
+                metadata['file_entries'] = file_count
+                metadata['verification_status'] = result['status']
+                with open(metadata_file, 'w') as f:
+                    json.dump(metadata, f, indent=2)
+            except Exception:
+                pass
+
+        return result
+
     def _are_spelling_variants(self, word1: str, word2: str, threshold: float = 0.85) -> bool:
         """
         Check if two words are spelling variants (e.g., British vs American).
@@ -1961,6 +2119,18 @@ class MultiGPUPseudoLabelGenerator:
         progress.last_sample_idx = last_sample_idx  # Track where we left off
         all_progress[name] = progress
         self._save_progress(all_progress)
+
+        # Update metadata with actual count after completion
+        # This fixes progress display when dataset iteration yields more/fewer samples than len(dataset)
+        self._update_metadata_with_actual_count(name)
+
+        # Verify completion and check for missing samples
+        # This helps identify if deduplication caused any gaps
+        verification = self._verify_and_fill_missing_samples(name, total_samples)
+
+        # Store verification results in progress
+        if verification:
+            progress.verification_status = verification.get('status', 'unknown')
 
         return progress
 

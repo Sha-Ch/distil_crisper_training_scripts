@@ -40,6 +40,20 @@ from datetime import datetime
 import time
 import re
 
+# =============================================================================
+# CRITICAL: Set cache directories to /workspace BEFORE importing HF libraries
+# This prevents downloads from filling up the container's limited root filesystem
+# =============================================================================
+_workspace_cache = "/workspace/hf_cache"
+os.makedirs(_workspace_cache, exist_ok=True)
+os.makedirs(f"{_workspace_cache}/datasets", exist_ok=True)
+os.makedirs(f"{_workspace_cache}/transformers", exist_ok=True)
+
+os.environ["HF_HOME"] = _workspace_cache
+os.environ["HF_DATASETS_CACHE"] = f"{_workspace_cache}/datasets"
+os.environ["TRANSFORMERS_CACHE"] = f"{_workspace_cache}/transformers"
+os.environ["HUGGINGFACE_HUB_CACHE"] = f"{_workspace_cache}/hub"
+
 import torch
 import numpy as np
 from tqdm import tqdm

@@ -149,7 +149,14 @@ def load_actual_sample_counts(pseudo_labels_dir: Path) -> dict:
     """
     Load ACTUAL sample counts from metadata files created by processing script.
 
-    The processing script saves {dataset}_metadata.json with exact counts when downloading.
+    The processing script saves {dataset}_metadata.json with counts:
+    - Initially: from len(dataset) when loading
+    - After completion: updated to actual processed count
+
+    The 'source' field indicates the reliability:
+    - 'actual_count': initial estimate from len(dataset)
+    - 'actual_processed': verified count from completed processing (most accurate)
+    - 'completed': true if processing finished and count is verified
     """
     actual_counts = {}
 
@@ -163,10 +170,19 @@ def load_actual_sample_counts(pseudo_labels_dir: Path) -> dict:
                 name = metadata.get('dataset')
                 total = metadata.get('total_samples')
                 if name and total:
+                    source = metadata.get('source', 'actual')
+                    # Mark as verified if the count was updated after processing
+                    if source == 'actual_processed' or metadata.get('completed', False):
+                        source = 'verified'
                     actual_counts[name] = {
                         'samples': total,
-                        'source': 'actual',
-                        'hours': DATASET_ESTIMATES.get(name, {}).get('hours', 0)
+                        'source': source,
+                        'hours': DATASET_ESTIMATES.get(name, {}).get('hours', 0),
+                        'completed': metadata.get('completed', False),
+                        'verified': metadata.get('verified', False),
+                        'verification_status': metadata.get('verification_status', ''),
+                        'unique_samples': metadata.get('unique_samples', total),
+                        'original_estimate': metadata.get('original_estimate', total)
                     }
         except Exception:
             continue
@@ -315,15 +331,25 @@ def create_gpu_table(gpus):
 
 
 def make_progress_bar(current, total, width=20):
-    """Create a text-based progress bar."""
+    """Create a text-based progress bar.
+
+    Handles cases where current > total (more samples processed than metadata predicted).
+    This can happen when dataset iteration yields slightly more samples than len(dataset).
+    """
     if total == 0:
         return "[dim]" + "-" * width + "[/dim]"
 
-    pct = min(current / total, 1.0)
+    # Calculate actual ratio (can be > 1.0 if processed more than expected)
+    ratio = current / total
+    # Cap at 1.0 for display purposes
+    pct = min(ratio, 1.0)
     filled = int(pct * width)
     empty = width - filled
 
-    if pct >= 1.0:
+    if ratio >= 1.0:
+        # Complete - show full bar (green for exactly done, cyan for exceeded)
+        if ratio > 1.0:
+            return f"[cyan]{'█' * width}[/cyan]"  # Cyan = exceeded expected
         return f"[green]{'█' * width}[/green]"
     elif pct > 0:
         return f"[green]{'█' * filled}[/green][dim]{'░' * empty}[/dim]"
@@ -395,8 +421,22 @@ def create_dataset_table(file_stats, progress_data, pseudo_labels_dir: Path):
 
         # Status from progress data
         status = ds_info.get('status', 'pending')
+        verification_status = estimates.get('verification_status', '')
+        is_verified = estimates.get('verified', False)
+
         if status == 'completed':
-            status_str = "[green]DONE[/green]"
+            # Show verification status for completed datasets
+            if is_verified:
+                if verification_status == 'verified':
+                    status_str = "[bold green]VERIFIED[/bold green]"
+                elif verification_status == 'exceeded':
+                    status_str = "[cyan]DONE+[/cyan]"  # Exceeded expected
+                elif verification_status == 'missing_samples':
+                    status_str = "[yellow]DONE*[/yellow]"  # Some samples missing (likely deduped)
+                else:
+                    status_str = "[green]DONE[/green]"
+            else:
+                status_str = "[green]DONE[/green]"
         elif status == 'processing':
             status_str = "[bold yellow]RUNNING[/bold yellow]"
             current_dataset = name
@@ -410,14 +450,21 @@ def create_dataset_table(file_stats, progress_data, pseudo_labels_dir: Path):
         # Progress bar
         progress_bar = make_progress_bar(processed, estimated_total, width=15)
         pct = (processed / estimated_total * 100) if estimated_total > 0 else 0
-        progress_str = f"{progress_bar} {pct:4.1f}%"
+        # Show actual percentage (can exceed 100% if more samples than metadata predicted)
+        # This is informative - shows dataset iteration yielded more than len(dataset)
+        if pct > 100:
+            progress_str = f"{progress_bar} [cyan]{pct:4.1f}%[/cyan]"
+        else:
+            progress_str = f"{progress_bar} {pct:4.1f}%"
 
         if processed > 0 or status == 'processing':
+            # If processed > estimated, show 0 remaining but indicate completion
+            remaining_display = f"[yellow]{remaining:,}[/yellow]" if remaining > 0 else "[green]0[/green]"
             table.add_row(
                 f"[bold]{name}[/bold]" if status == 'processing' else name,
                 progress_str,
                 f"[cyan]{processed:,}[/cyan]",
-                f"[yellow]{remaining:,}[/yellow]" if remaining > 0 else "[green]0[/green]",
+                remaining_display,
                 f"{acc_rate:.0f}%",
                 f"{avg_wer:.1f}%" if accepted > 0 else "-",
                 status_str
@@ -435,14 +482,20 @@ def create_dataset_table(file_stats, progress_data, pseudo_labels_dir: Path):
 
     # Total row
     total_pct = (total_processed / total_estimated * 100) if total_estimated > 0 else 0
-    total_remaining = total_estimated - total_processed
+    total_remaining = max(0, total_estimated - total_processed)  # Don't show negative remaining
     total_acc_rate = (total_accepted / total_processed * 100) if total_processed > 0 else 0
+
+    # Format percentage - show cyan if exceeded expected
+    if total_pct > 100:
+        pct_str = f"[cyan]{total_pct:4.1f}%[/cyan]"
+    else:
+        pct_str = f"{total_pct:4.1f}%"
 
     table.add_row(
         "[bold]TOTAL[/bold]",
-        f"{make_progress_bar(total_processed, total_estimated, width=15)} {total_pct:4.1f}%",
+        f"{make_progress_bar(total_processed, total_estimated, width=15)} {pct_str}",
         f"[bold cyan]{total_processed:,}[/bold cyan]",
-        f"[bold yellow]{total_remaining:,}[/bold yellow]",
+        f"[bold yellow]{total_remaining:,}[/bold yellow]" if total_remaining > 0 else "[bold green]0[/bold green]",
         f"[bold]{total_acc_rate:.0f}%[/bold]",
         "",
         ""
@@ -595,7 +648,9 @@ def create_dashboard(pseudo_labels_dir: Path, start_time: datetime):
 
     # Footer - check if we have actual counts from metadata files
     all_estimates = get_dataset_estimates(pseudo_labels_dir, file_stats, progress_data)
-    actual_count = sum(1 for e in all_estimates.values() if e.get('source') == 'actual')
+    # Count datasets with verified (completed) or actual (from metadata) counts
+    actual_count = sum(1 for e in all_estimates.values()
+                       if e.get('source') in ('actual', 'verified'))
     total_datasets = len(all_estimates)
 
     footer_text = Text()
