@@ -1159,13 +1159,20 @@ class MultiGPUPseudoLabelGenerator:
         cache_file = self.pseudo_labels_dir / f'{name}_processed_texts.cache'
 
         # Get modification times of all JSONL files
+        # Filter to only files that still exist (race condition protection)
         jsonl_files = list(self.pseudo_labels_dir.glob(f'{name}_gpu*_accepted.jsonl'))
         jsonl_files.extend(self.pseudo_labels_dir.glob(f'{name}_gpu*_rejected.jsonl'))
+        jsonl_files = [f for f in jsonl_files if f.exists()]
 
         if not jsonl_files:
             return processed_texts
 
-        latest_jsonl_mtime = max(f.stat().st_mtime for f in jsonl_files)
+        # Get latest modification time with race condition protection
+        try:
+            latest_jsonl_mtime = max(f.stat().st_mtime for f in jsonl_files if f.exists())
+        except (ValueError, FileNotFoundError):
+            # Files were deleted between glob and stat - rebuild cache from scratch
+            latest_jsonl_mtime = 0
 
         # Check if cache is valid (exists and newer than all JSONL files)
         if cache_file.exists():
@@ -1186,17 +1193,24 @@ class MultiGPUPseudoLabelGenerator:
             console.print(f"[yellow]Building text cache from JSONL files...[/yellow]")
 
         for jsonl_file in jsonl_files:
+            # Skip files that no longer exist (race condition with cache invalidation)
+            if not jsonl_file.exists():
+                continue
             try:
                 with open(jsonl_file, 'r') as f:
                     for line in f:
                         try:
                             entry = json.loads(line)
                             # Use ground_truth for deduplication (stable across runs)
+                            # Must match normalization in ThreadedPrefetcher._worker_loop()
                             ground_truth = entry.get('ground_truth', '').strip()
                             if ground_truth:
                                 processed_texts.add(ground_truth)
                         except json.JSONDecodeError:
                             continue
+            except (FileNotFoundError, IOError):
+                # File was deleted or inaccessible - skip it
+                continue
             except Exception:
                 pass
 
@@ -2081,7 +2095,8 @@ class MultiGPUPseudoLabelGenerator:
 
                     # Invalidate cache so it gets rebuilt on next resume
                     # (simpler than incremental updates, and resume is now fast anyway)
-                    cache_file = self.pseudo_labels_dir / f'{name}_processed_ids.cache'
+                    # NOTE: Must match the cache filename in _load_processed_ids_from_files()
+                    cache_file = self.pseudo_labels_dir / f'{name}_processed_texts.cache'
                     if cache_file.exists():
                         try:
                             cache_file.unlink()
