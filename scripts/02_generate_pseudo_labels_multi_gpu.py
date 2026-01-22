@@ -54,6 +54,9 @@ from datetime import datetime
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from queue import Queue, Empty
+from threading import Thread, Event
+import hashlib
 
 import torch
 import torchaudio
@@ -307,6 +310,310 @@ class DatasetProgress:
         if self.samples_accepted == 0:
             return 0.0
         return self.wer_sum / self.samples_accepted
+
+
+def generate_content_hash(audio_array: np.ndarray, text: str, dataset_name: str) -> str:
+    """
+    Generate a deterministic, content-based hash ID for a sample.
+
+    This ensures the same sample always gets the same ID, regardless of:
+    - Dataset iteration order
+    - Run number
+    - GPU count or which GPU processes it
+
+    Uses:
+    - First 4000 audio samples (or all if shorter) - captures unique audio signature
+    - Ground truth text - additional uniqueness
+    - Dataset name - namespace to avoid collisions
+
+    Returns a 16-character hex string like "ami_a1b2c3d4e5f6g7h8"
+    (64 bits = collision probability ~0.03% at 20M samples - acceptable)
+
+    NOTE: DO NOT change hash length without migration strategy!
+    Existing processed IDs use 16-char hashes.
+    """
+    hasher = hashlib.md5()
+
+    # Hash audio content (first 4000 samples = ~0.25s at 16kHz)
+    # Using tobytes() is fast and deterministic for same audio
+    audio_slice = audio_array[:4000] if len(audio_array) > 4000 else audio_array
+    hasher.update(audio_slice.tobytes())
+
+    # Hash the text
+    hasher.update(text.encode('utf-8'))
+
+    # Include dataset name
+    hasher.update(dataset_name.encode('utf-8'))
+
+    # Return formatted ID: {dataset}_{hash16}
+    return f"{dataset_name}_{hasher.hexdigest()[:16]}"
+
+
+class ThreadedPrefetcher:
+    """
+    Multi-threaded prefetcher for dataset samples.
+
+    Architecture (optimized for 16 CPU cores):
+    ┌─────────────┐    ┌──────────────────┐    ┌─────────────┐
+    │   Dataset   │───>│  Raw Sample Queue │───>│  Worker Pool │
+    │  Iterator   │    │   (unbounded)     │    │  (N threads) │
+    │  (1 thread) │    └──────────────────┘    └──────┬──────┘
+    └─────────────┘                                    │
+                                                       v
+                                              ┌──────────────────┐
+                                              │ Processed Queue  │───> GPU Batches
+                                              │ (bounded, 4*batch)│
+                                              └──────────────────┘
+
+    - 1 feeder thread: iterates dataset, puts raw samples in queue
+    - N worker threads: extract audio, compute hash, filter, validate
+    - Main thread: pulls batches for GPU processing
+
+    Big O:
+    - Hash generation: O(1) - constant 4000 samples
+    - Dedup lookup: O(1) - hash set
+    - Per-sample processing: O(audio_length) but parallelized across N workers
+    """
+
+    def __init__(
+        self,
+        dataset_iter: Iterator,
+        start_idx: int,
+        world_size: int,
+        local_rank: int,
+        already_processed_ids: set,
+        audio_col: str,
+        text_col: str,
+        min_duration: float,
+        max_duration: float,
+        name: str,
+        prefetch_batches: int = 4,  # How many batches to prefetch
+        batch_size: int = 48,
+        num_workers: int = 8,  # Number of worker threads
+    ):
+        self.dataset_iter = dataset_iter
+        self.sample_idx = start_idx
+        self.world_size = world_size
+        self.local_rank = local_rank
+        self.already_processed_ids = already_processed_ids
+        self.audio_col = audio_col
+        self.text_col = text_col
+        self.min_duration = min_duration
+        self.max_duration = max_duration
+        self.name = name
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+
+        # Raw sample queue (feeder -> workers) - unbounded for speed
+        self.raw_queue = Queue(maxsize=num_workers * 4)
+
+        # Processed sample queue (workers -> main) - bounded to control memory
+        self.processed_queue = Queue(maxsize=prefetch_batches * batch_size)
+
+        self.stop_event = Event()
+        self.feeder_done = Event()  # Set when feeder finishes iterating
+        self.exhausted = Event()    # Set when all workers are done
+
+        # Thread-safe stats using locks
+        self._stats_lock = Event()  # Using Event as a simple flag
+        import threading
+        self._lock = threading.Lock()
+        self._skipped_in_loop = 0
+        self._rejected_duration = 0
+        self._total_duration_hours = 0.0
+        self._workers_done = 0
+
+        # Start threads
+        self.threads = []
+        self._start_workers()
+
+    def _start_workers(self):
+        """Start the feeder and worker threads."""
+        # 1 feeder thread - iterates dataset
+        feeder = Thread(target=self._feeder_loop, daemon=True, name="prefetch-feeder")
+        feeder.start()
+        self.threads.append(feeder)
+
+        # N worker threads - process samples in parallel
+        for i in range(self.num_workers):
+            worker = Thread(target=self._worker_loop, daemon=True, name=f"prefetch-worker-{i}")
+            worker.start()
+            self.threads.append(worker)
+
+    def _feeder_loop(self):
+        """Feeder thread: iterates dataset and queues raw samples."""
+        try:
+            sample_idx = self.sample_idx
+            for sample in self.dataset_iter:
+                if self.stop_event.is_set():
+                    break
+
+                # Put raw sample with its index into queue
+                # Workers will do the heavy lifting (extraction, hashing, filtering)
+                self.raw_queue.put((sample, sample_idx))
+                sample_idx += 1
+
+        except Exception:
+            pass
+        finally:
+            self.feeder_done.set()
+            # Signal workers that no more raw samples are coming
+            for _ in range(self.num_workers):
+                self.raw_queue.put(None)  # Poison pills
+
+    def _worker_loop(self):
+        """Worker thread: processes raw samples in parallel."""
+        local_skipped = 0
+        local_rejected = 0
+        local_duration = 0.0
+
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    item = self.raw_queue.get(timeout=1.0)
+                except Empty:
+                    if self.feeder_done.is_set() and self.raw_queue.empty():
+                        break
+                    continue
+
+                if item is None:  # Poison pill
+                    break
+
+                sample, sample_idx = item
+
+                # Process sample (extract audio, hash, filter)
+                result = self._process_sample(sample, sample_idx)
+                if result is None:
+                    continue
+
+                # Unpack to check dedup and sharding
+                audio_array, sr, ground_truth, sample_id, duration, idx = result
+
+                # Update local duration stats
+                local_duration += duration / 3600
+
+                # Skip if already processed (O(1) hash set lookup)
+                if sample_id in self.already_processed_ids:
+                    local_skipped += 1
+                    continue
+
+                # Multi-GPU sharding - deterministic based on content hash
+                shard_key = int(hashlib.md5(sample_id.encode()).hexdigest()[:8], 16)
+                if shard_key % self.world_size != self.local_rank:
+                    continue
+
+                # Put in processed queue (may block if full - backpressure)
+                # Retry with longer timeout to avoid dropping samples
+                put_success = False
+                for _ in range(12):  # 12 * 5s = 60s max wait
+                    if self.stop_event.is_set():
+                        break
+                    try:
+                        self.processed_queue.put(result, timeout=5.0)
+                        put_success = True
+                        break
+                    except:
+                        continue  # Retry
+
+                if not put_success and not self.stop_event.is_set():
+                    # Log dropped sample (shouldn't happen in normal operation)
+                    pass
+
+        except Exception:
+            pass
+        finally:
+            # Aggregate stats thread-safely
+            with self._lock:
+                self._skipped_in_loop += local_skipped
+                self._rejected_duration += local_rejected
+                self._total_duration_hours += local_duration
+                self._workers_done += 1
+
+                # If all workers done, signal exhausted
+                if self._workers_done >= self.num_workers:
+                    self.exhausted.set()
+
+    def _process_sample(self, sample, sample_idx: int):
+        """Process a single sample and generate content-based ID. Thread-safe."""
+        try:
+            # Extract audio
+            audio_data = sample.get(self.audio_col, {})
+            if not isinstance(audio_data, dict):
+                return None
+
+            audio_array = np.array(audio_data['array'], dtype=np.float32)
+            sr = audio_data['sampling_rate']
+
+            # Get ground truth
+            ground_truth = sample.get(self.text_col, '')
+            if not ground_truth or not isinstance(ground_truth, str):
+                return None
+
+            # Generate CONTENT-BASED sample ID (O(1) - only first 4000 samples)
+            sample_id = generate_content_hash(audio_array, ground_truth, self.name)
+
+            # Calculate duration
+            duration = len(audio_array) / sr
+
+            # Duration filter
+            if duration < self.min_duration or duration > self.max_duration:
+                return None
+
+            return (audio_array, sr, ground_truth, sample_id, duration, sample_idx)
+
+        except Exception:
+            return None
+
+    def get_batch(self, timeout: float = 30.0) -> List[Tuple]:
+        """Get a batch of preprocessed samples from the worker pool."""
+        batch = []
+        deadline = time.time() + timeout
+
+        while len(batch) < self.batch_size:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+
+            try:
+                item = self.processed_queue.get(timeout=min(remaining, 1.0))
+                batch.append(item)
+            except Empty:
+                # Check if we're done (all workers finished and queue empty)
+                if self.exhausted.is_set() and self.processed_queue.empty():
+                    break
+
+        return batch
+
+    def is_exhausted(self) -> bool:
+        """Check if all workers are done and processed queue is empty."""
+        return self.exhausted.is_set() and self.processed_queue.empty()
+
+    def stop(self):
+        """Signal all threads to stop gracefully."""
+        self.stop_event.set()
+        # Clear queues to unblock any waiting threads
+        try:
+            while not self.raw_queue.empty():
+                self.raw_queue.get_nowait()
+        except:
+            pass
+        try:
+            while not self.processed_queue.empty():
+                self.processed_queue.get_nowait()
+        except:
+            pass
+
+    def get_stats(self) -> dict:
+        """Get prefetcher statistics (thread-safe)."""
+        with self._lock:
+            return {
+                'skipped_in_loop': self._skipped_in_loop,
+                'rejected_duration': self._rejected_duration,
+                'total_duration_hours': self._total_duration_hours,
+                'workers_active': self.num_workers - self._workers_done,
+                'raw_queue_size': self.raw_queue.qsize(),
+                'queue_size': self.processed_queue.qsize(),
+            }
 
 
 class SpotInstanceHandler:
@@ -765,25 +1072,60 @@ class MultiGPUPseudoLabelGenerator:
 
         This allows resuming even if progress.json was lost, by scanning
         the actual output files from ALL GPUs.
+
+        OPTIMIZATION: Uses a cached ID file for O(1) resume when possible.
+        The cache is invalidated if JSONL files are newer than the cache.
         """
         processed_ids = set()
+        cache_file = self.pseudo_labels_dir / f'{name}_processed_ids.cache'
 
-        # Scan all GPU output files (handles any GPU count)
-        for accepted_file in self.pseudo_labels_dir.glob(f'{name}_gpu*_accepted.jsonl'):
+        # Get modification times of all JSONL files
+        jsonl_files = list(self.pseudo_labels_dir.glob(f'{name}_gpu*_accepted.jsonl'))
+        jsonl_files.extend(self.pseudo_labels_dir.glob(f'{name}_gpu*_rejected.jsonl'))
+
+        if not jsonl_files:
+            return processed_ids
+
+        latest_jsonl_mtime = max(f.stat().st_mtime for f in jsonl_files)
+
+        # Check if cache is valid (exists and newer than all JSONL files)
+        if cache_file.exists():
+            cache_mtime = cache_file.stat().st_mtime
+            if cache_mtime >= latest_jsonl_mtime:
+                # Cache is valid - O(n) read but faster than JSON parsing
+                try:
+                    with open(cache_file, 'r') as f:
+                        processed_ids = set(line.strip() for line in f if line.strip())
+                    if self.is_main:
+                        console.print(f"[green]Loaded {len(processed_ids):,} IDs from cache (fast resume)[/green]")
+                    return processed_ids
+                except Exception:
+                    pass  # Fall through to rebuild cache
+
+        # Cache miss or invalid - scan JSONL files
+        if self.is_main:
+            console.print(f"[yellow]Building ID cache from JSONL files...[/yellow]")
+
+        for jsonl_file in jsonl_files:
             try:
-                with open(accepted_file, 'r') as f:
+                with open(jsonl_file, 'r') as f:
                     for line in f:
-                        entry = json.loads(line)
-                        processed_ids.add(entry.get('sample_id', ''))
+                        try:
+                            entry = json.loads(line)
+                            sample_id = entry.get('sample_id', '')
+                            if sample_id:
+                                processed_ids.add(sample_id)
+                        except json.JSONDecodeError:
+                            continue
             except Exception:
                 pass
 
-        for rejected_file in self.pseudo_labels_dir.glob(f'{name}_gpu*_rejected.jsonl'):
+        # Save cache for next time (only main process to avoid race)
+        if self.is_main and processed_ids:
             try:
-                with open(rejected_file, 'r') as f:
-                    for line in f:
-                        entry = json.loads(line)
-                        processed_ids.add(entry.get('sample_id', ''))
+                with open(cache_file, 'w') as f:
+                    f.write('\n'.join(processed_ids))
+                console.print(f"[green]Saved ID cache ({len(processed_ids):,} IDs)[/green]")
             except Exception:
                 pass
 
@@ -845,9 +1187,13 @@ class MultiGPUPseudoLabelGenerator:
         text = ' '.join(text.split())
         return text
 
-    def _load_dataset(self, name: str) -> Tuple[Optional[Iterator], Optional[int]]:
+    def _load_dataset(self, name: str, skip_to: int = 0) -> Tuple[Optional[Iterator], Optional[int]]:
         """
         Load dataset - DOWNLOAD for small datasets, STREAM for massive ones.
+
+        Args:
+            name: Dataset name
+            skip_to: Number of samples to skip (for fast resume)
 
         Returns:
             Tuple of (dataset_iterator, total_sample_count)
@@ -943,6 +1289,29 @@ class MultiGPUPseudoLabelGenerator:
                     if self.is_main:
                         console.print(f"[cyan]  {name}: {total_samples:,} samples (exact count)[/cyan]")
 
+            # FAST RESUME: Skip to resume point efficiently
+            if skip_to > 0:
+                if use_streaming:
+                    # For streaming datasets, use .skip() method
+                    if hasattr(dataset, 'skip'):
+                        if self.is_main:
+                            console.print(f"[yellow]Fast-forwarding {skip_to:,} samples (streaming skip)...[/yellow]")
+                        dataset = dataset.skip(skip_to)
+                    else:
+                        if self.is_main:
+                            console.print(f"[yellow]Dataset doesn't support skip(), will iterate through {skip_to:,} samples[/yellow]")
+                else:
+                    # For downloaded datasets, use .select() for instant O(1) access
+                    if skip_to < total_samples:
+                        if self.is_main:
+                            console.print(f"[yellow]Fast-forwarding to sample {skip_to:,} (instant select)...[/yellow]")
+                        remaining_indices = list(range(skip_to, total_samples))
+                        dataset = dataset.select(remaining_indices)
+                    else:
+                        if self.is_main:
+                            console.print(f"[green]Dataset already fully processed ({skip_to:,} >= {total_samples:,})[/green]")
+                        return iter([]), total_samples  # Empty iterator, already done
+
             if self.is_main:
                 console.print(f"[green]✓ {name} loaded successfully[/green]")
 
@@ -958,7 +1327,7 @@ class MultiGPUPseudoLabelGenerator:
     # Keep old method name for backwards compatibility
     def _load_dataset_streaming(self, name: str) -> Optional[Iterator]:
         """Legacy method - use _load_dataset instead."""
-        dataset_iter, _ = self._load_dataset(name)
+        dataset_iter, _ = self._load_dataset(name, skip_to=0)
         return dataset_iter
 
     def _extract_audio_from_sample(self, sample: Dict, audio_col: str) -> Optional[Tuple[np.ndarray, int]]:
@@ -1087,20 +1456,18 @@ class MultiGPUPseudoLabelGenerator:
         all_progress = self._load_progress()
         progress = all_progress.get(name, DatasetProgress(name=name))
 
-        # GPU-AGNOSTIC RESUME: Load processed sample IDs from ALL output files
-        # This works even if GPU count changed or progress.json was lost
+        # CONTENT-BASED RESUME: Load processed sample IDs from ALL output files
+        # IDs are now content-based hashes (e.g., "ami_a1b2c3d4e5f6g7h8")
+        # This ensures same audio+text always gets same ID regardless of:
+        # - Dataset iteration order (which may vary between runs!)
+        # - GPU count or which GPU processes it
+        # - Run number
         already_processed_ids = set()
         if resume:
             already_processed_ids = self._load_processed_ids_from_files(name)
             if already_processed_ids and self.is_main:
-                console.print(f"[yellow]Found {len(already_processed_ids):,} already processed samples for {name}[/yellow]")
-
-        # Check if GPU count changed (for diagnostic logging)
-        previous_gpu_count = progress.gpu_count_at_start if progress.samples_processed > 0 else self.world_size
-        if resume and progress.samples_processed > 0 and previous_gpu_count != self.world_size:
-            if self.is_main:
-                console.print(f"[bold yellow]GPU count changed: {previous_gpu_count} → {self.world_size}[/bold yellow]")
-                console.print(f"[yellow]Using sample-ID based resume (GPU-agnostic)[/yellow]")
+                console.print(f"[green]Found {len(already_processed_ids):,} already processed samples for {name}[/green]")
+                console.print(f"[cyan]Using content-based deduplication (order-independent)[/cyan]")
 
         # Always append mode if resuming with existing samples
         if resume and already_processed_ids:
@@ -1113,8 +1480,8 @@ class MultiGPUPseudoLabelGenerator:
         progress.gpu_count_at_start = self.world_size
         progress.status = "processing"
 
-        # Load dataset - now returns actual sample count for downloaded datasets
-        dataset_iter, total_samples = self._load_dataset(name)
+        # Load dataset (no skip - we use content-based deduplication instead)
+        dataset_iter, total_samples = self._load_dataset(name, skip_to=0)
         if dataset_iter is None:
             progress.status = "error"
             progress.error_message = "Failed to load dataset"
@@ -1147,7 +1514,34 @@ class MultiGPUPseudoLabelGenerator:
             # Fallback to estimate for streaming datasets
             pbar_total = max_samples or config['estimated_hours'] * 120
 
-        # Process samples with BATCHING
+        # Determine number of prefetch workers based on CPU cores
+        # Use ~half the cores for prefetching to leave room for other work
+        import multiprocessing
+        num_cpu_cores = multiprocessing.cpu_count()
+        num_prefetch_workers = max(4, min(num_cpu_cores // 2, 8))
+
+        if self.is_main:
+            console.print(f"[cyan]Using {num_prefetch_workers} prefetch threads ({num_cpu_cores} CPU cores available)[/cyan]")
+
+        # Create threaded prefetcher for parallel sample loading
+        # Uses content-based hashing for deduplication (order-independent!)
+        prefetcher = ThreadedPrefetcher(
+            dataset_iter=dataset_iter,
+            start_idx=0,  # Always start from 0, dedup handles resume
+            world_size=self.world_size,
+            local_rank=self.local_rank,
+            already_processed_ids=already_processed_ids,
+            audio_col=audio_col,
+            text_col=text_col,
+            min_duration=self.min_duration,
+            max_duration=self.max_duration,
+            name=name,
+            prefetch_batches=4,  # Prefetch 4 batches ahead
+            batch_size=self.batch_size,
+            num_workers=num_prefetch_workers,
+        )
+
+        # Process samples with BATCHING using threaded prefetcher
         with open(output_file, mode) as out_f, open(rejected_file, mode) as rej_f:
             # Progress bar only on main process
             if self.is_main:
@@ -1160,116 +1554,23 @@ class MultiGPUPseudoLabelGenerator:
             else:
                 pbar = None
 
-            sample_idx = 0
-            batch_data = []  # Collect samples for batched processing
-            skipped_already_processed = 0
+            last_sample_idx = 0
 
-            for sample in dataset_iter:
-                if self.spot_handler.should_stop:
-                    break
+            # Main processing loop - pull batches from prefetcher
+            while not self.spot_handler.should_stop:
+                # Get a batch from the prefetcher (blocks until ready or timeout)
+                batch_data = prefetcher.get_batch(timeout=60.0)
 
-                # Generate sample ID FIRST (before sharding check)
-                sample_id = f"{name}_{sample_idx:010d}"
-
-                # GPU-AGNOSTIC RESUME: Skip if already processed by ANY GPU
-                if sample_id in already_processed_ids:
-                    sample_idx += 1
-                    skipped_already_processed += 1
-                    continue
-
-                # Multi-GPU sharding: each GPU processes every Nth sample
-                # This only applies to NEW samples (not already processed ones)
-                if sample_idx % self.world_size != self.local_rank:
-                    sample_idx += 1
+                if not batch_data:
+                    # No more data
+                    if prefetcher.is_exhausted():
+                        break
                     continue
 
                 if max_samples and samples_this_run >= max_samples // self.world_size:
                     break
 
-                try:
-                    # Extract audio
-                    audio_result = self._extract_audio_from_sample(sample, audio_col)
-                    if audio_result is None:
-                        sample_idx += 1
-                        continue
-
-                    audio_array, sr = audio_result
-
-                    # Get ground truth text
-                    ground_truth = sample.get(text_col, '')
-                    if not ground_truth or not isinstance(ground_truth, str):
-                        sample_idx += 1
-                        continue
-
-                    # Calculate duration
-                    duration = len(audio_array) / sr
-                    progress.total_duration_hours += duration / 3600
-
-                    # Duration filter
-                    if duration < self.min_duration or duration > self.max_duration:
-                        progress.samples_rejected_duration += 1
-                        sample_idx += 1
-                        progress.samples_processed += 1
-                        samples_this_run += 1
-                        if pbar:
-                            pbar.update(1)
-                        continue
-
-                    # Add to batch (sample_id already generated above)
-                    batch_data.append((audio_array, sr, ground_truth, sample_id, duration, sample_idx))
-
-                    # Process batch when full
-                    if len(batch_data) >= self.batch_size:
-                        entries = self._process_batch_gpu(batch_data, name)
-
-                        for entry in entries:
-                            entry_json = json.dumps(asdict(entry))
-
-                            if entry.accepted:
-                                out_f.write(entry_json + '\n')
-                                progress.samples_accepted += 1
-                                progress.accepted_duration_hours += entry.duration_seconds / 3600
-                                progress.wer_sum += entry.wer
-                            else:
-                                rej_f.write(entry_json + '\n')
-                                progress.samples_rejected_wer += 1
-
-                            progress.samples_processed += 1
-                            progress.last_sample_id = entry.sample_id
-                            samples_this_run += 1
-
-                        # Flush files
-                        out_f.flush()
-                        rej_f.flush()
-
-                        # Update progress bar
-                        if pbar:
-                            acc_rate = progress.acceptance_rate * 100
-                            avg_wer = progress.avg_wer * 100
-                            pbar.set_postfix({
-                                'acc': f'{acc_rate:.1f}%',
-                                'wer': f'{avg_wer:.1f}%',
-                                'hrs': f'{progress.accepted_duration_hours:.1f}',
-                                'skip': skipped_already_processed  # Show skipped count
-                            })
-                            pbar.update(len(batch_data))
-
-                        # Save progress periodically
-                        if progress.samples_processed % 500 == 0:
-                            all_progress[name] = progress
-                            self._save_progress(all_progress)
-
-                        batch_data = []  # Clear batch
-
-                    sample_idx += 1
-
-                except Exception as e:
-                    progress.samples_rejected_other += 1
-                    sample_idx += 1
-                    continue
-
-            # Process remaining samples in final batch
-            if batch_data and not self.spot_handler.should_stop:
+                # Process batch on GPU
                 entries = self._process_batch_gpu(batch_data, name)
 
                 for entry in entries:
@@ -1288,19 +1589,62 @@ class MultiGPUPseudoLabelGenerator:
                     progress.last_sample_id = entry.sample_id
                     samples_this_run += 1
 
+                # Track last sample index from batch
+                if batch_data:
+                    last_sample_idx = max(item[5] for item in batch_data)  # sample_idx is at index 5
+
+                # Flush files
+                out_f.flush()
+                rej_f.flush()
+
+                # Update progress bar
                 if pbar:
+                    prefetch_stats = prefetcher.get_stats()
+                    acc_rate = progress.acceptance_rate * 100
+                    avg_wer = progress.avg_wer * 100
+                    pbar.set_postfix({
+                        'acc': f'{acc_rate:.1f}%',
+                        'wer': f'{avg_wer:.1f}%',
+                        'hrs': f'{progress.accepted_duration_hours:.1f}',
+                        'q': prefetch_stats['queue_size'],  # Processed queue size
+                        'w': prefetch_stats['workers_active'],  # Active workers
+                    })
                     pbar.update(len(batch_data))
+
+                # Save progress periodically
+                if progress.samples_processed % 500 == 0:
+                    all_progress[name] = progress
+                    self._save_progress(all_progress)
+
+                    # Invalidate cache so it gets rebuilt on next resume
+                    # (simpler than incremental updates, and resume is now fast anyway)
+                    cache_file = self.pseudo_labels_dir / f'{name}_processed_ids.cache'
+                    if cache_file.exists():
+                        try:
+                            cache_file.unlink()
+                        except Exception:
+                            pass
+
+            # Stop prefetcher
+            prefetcher.stop()
 
             if pbar:
                 pbar.close()
 
+        # Get final stats from prefetcher
+        prefetch_stats = prefetcher.get_stats()
+        skipped_in_loop = prefetch_stats['skipped_in_loop']
+        progress.samples_rejected_duration += prefetch_stats['rejected_duration']
+        progress.total_duration_hours += prefetch_stats['total_duration_hours']
+
         # Log resume stats
-        if self.is_main and skipped_already_processed > 0:
-            console.print(f"[dim]Skipped {skipped_already_processed:,} already-processed samples[/dim]")
+        if self.is_main:
+            if skipped_in_loop > 0:
+                console.print(f"[green]Skipped {skipped_in_loop:,} already-processed samples (content-based dedup)[/green]")
 
         # Final save
         progress.status = "completed"
-        progress.last_sample_idx = sample_idx  # Track where we left off
+        progress.last_sample_idx = last_sample_idx  # Track where we left off
         all_progress[name] = progress
         self._save_progress(all_progress)
 
