@@ -41,6 +41,15 @@ References:
 
 import os
 import sys
+
+# =============================================================================
+# CRITICAL: Configure HuggingFace to resume partial downloads
+# Must be set BEFORE importing datasets/huggingface_hub
+# =============================================================================
+# Enable download resume for interrupted transfers
+os.environ.setdefault('HF_HUB_ENABLE_HF_TRANSFER', '1')  # Faster downloads with resume
+os.environ.setdefault('HF_HUB_DOWNLOAD_TIMEOUT', '1800')  # 30 min timeout per file
+
 import json
 import yaml
 import argparse
@@ -310,9 +319,10 @@ DATASET_CONFIGS = {
         'requires_auth': True,
         'priority': 7,
         'quality': 'high',
-        # Chunked download settings - download ~100GB at a time to avoid rate limiting
+        # Chunked download settings - download ~20GB at a time to fit in 2TB disk
+        # Cache is cleaned after each chunk to free space
         'use_chunked_download': True,
-        'chunk_size_gb': 100,  # Target chunk size in GB (±10GB variance OK)
+        'chunk_size_gb': 20,  # Small chunks to fit in limited disk space
         'estimated_sample_size_mb': 5,  # Avg sample size for chunk calculation
     },
 
@@ -327,9 +337,9 @@ DATASET_CONFIGS = {
         'requires_auth': True,
         'priority': 8,
         'quality': 'medium',
-        # Chunked download settings
+        # Chunked download settings - 20GB chunks for limited disk
         'use_chunked_download': True,
-        'chunk_size_gb': 100,
+        'chunk_size_gb': 20,
         'estimated_sample_size_mb': 3,
     },
 
@@ -344,9 +354,9 @@ DATASET_CONFIGS = {
         'requires_auth': False,
         'priority': 9,
         'quality': 'variable',
-        # Chunked download settings
+        # Chunked download settings - 20GB chunks for limited disk
         'use_chunked_download': True,
-        'chunk_size_gb': 100,
+        'chunk_size_gb': 20,
         'estimated_sample_size_mb': 4,
     },
 }
@@ -2284,6 +2294,11 @@ class MultiGPUPseudoLabelGenerator:
         then moves to the next chunk. This simulates streaming behavior but
         with downloaded data for better performance.
 
+        CRITICAL: Uses rank-0-first download pattern to prevent NCCL timeouts.
+        Rank 0 downloads data first (populating HuggingFace cache), then other
+        ranks load from the cached data. This ensures all GPUs stay synchronized
+        and no GPU gets stuck waiting on slow/failed downloads.
+
         Args:
             name: Dataset name
             chunk_size_gb: Target chunk size in GB (default 100GB, ±10GB variance)
@@ -2308,63 +2323,143 @@ class MultiGPUPseudoLabelGenerator:
         # Load chunk progress
         chunk_info = self._get_chunk_info(name)
 
-        # Check HF authentication
+        # Check HF authentication - only main process to avoid race
         global _HF_AUTH_CHECKED
         if not _HF_AUTH_CHECKED and self.is_main:
             setup_hf_authentication()
             _HF_AUTH_CHECKED = True
 
-        # Stagger GPU requests
-        if self.is_distributed and self.local_rank > 0:
-            delay = self.local_rank * 0.5 + random.uniform(0, 0.5)
-            time.sleep(delay)
+        # Helper function with retry logic and timeout handling
+        def load_with_retry(hf_name, max_retries=5, download_timeout=1800, **kwargs):
+            """
+            Load dataset with retry logic and timeout handling.
+
+            Args:
+                hf_name: HuggingFace dataset name
+                max_retries: Maximum number of retry attempts
+                download_timeout: Timeout in seconds for each download attempt (default 30 min)
+                **kwargs: Additional arguments for load_dataset
+            """
+            import threading
+
+            log(f"[DOWNLOAD] Starting load_with_retry for {hf_name}, timeout={download_timeout}s, max_retries={max_retries}", 'debug')
+
+            for attempt in range(max_retries):
+                try:
+                    log(f"[DOWNLOAD] Attempt {attempt+1}/{max_retries} for {hf_name}", 'debug')
+
+                    # Use a thread with timeout to handle hung downloads
+                    result = [None]
+                    exception = [None]
+
+                    def download_thread():
+                        try:
+                            result[0] = load_dataset(hf_name, **kwargs)
+                        except Exception as e:
+                            exception[0] = e
+
+                    thread = threading.Thread(target=download_thread)
+                    thread.daemon = True
+                    thread.start()
+                    thread.join(timeout=download_timeout)
+
+                    if thread.is_alive():
+                        # Download is taking too long, treat as timeout
+                        error_msg = f"Download timeout after {download_timeout}s for {hf_name}"
+                        log(f"[DOWNLOAD] {error_msg} (attempt {attempt+1}/{max_retries})", 'warning')
+                        if self.is_main:
+                            console.print(f"[yellow]{error_msg} (attempt {attempt+1}/{max_retries})...[/yellow]")
+                        # Can't really kill the thread, but we can retry
+                        # The old thread will eventually finish or fail
+                        if attempt < max_retries - 1:
+                            wait_time = min(60, (2 ** attempt) * 10)  # Exponential backoff, max 60s
+                            log(f"[DOWNLOAD] Waiting {wait_time:.0f}s before retry", 'info')
+                            if self.is_main:
+                                console.print(f"[yellow]Waiting {wait_time:.0f}s before retry...[/yellow]")
+                            time.sleep(wait_time)
+                            continue
+                        else:
+                            log(f"[DOWNLOAD] FAILED: {error_msg} after {max_retries} attempts", 'error')
+                            raise TimeoutError(error_msg)
+
+                    if exception[0] is not None:
+                        raise exception[0]
+
+                    log(f"[DOWNLOAD] Successfully loaded {hf_name}", 'info')
+                    return result[0]
+
+                except Exception as e:
+                    error_str = str(e).lower()
+                    if '429' in error_str or 'rate limit' in error_str or 'too many requests' in error_str:
+                        wait_time = (2 ** attempt) + random.uniform(0, 1)
+                        log(f"[DOWNLOAD] Rate limited for {hf_name}, waiting {wait_time:.1f}s (attempt {attempt+1}/{max_retries})", 'warning')
+                        if self.is_main:
+                            console.print(f"[yellow]Rate limited, waiting {wait_time:.1f}s (attempt {attempt+1}/{max_retries})...[/yellow]")
+                        time.sleep(wait_time)
+                    elif 'timeout' in error_str or 'timed out' in error_str:
+                        wait_time = min(120, (2 ** attempt) * 15)  # Longer wait for timeouts
+                        log(f"[DOWNLOAD] Connection timeout for {hf_name}, waiting {wait_time:.1f}s (attempt {attempt+1}/{max_retries})", 'warning')
+                        if self.is_main:
+                            console.print(f"[yellow]Connection timeout, waiting {wait_time:.1f}s (attempt {attempt+1}/{max_retries})...[/yellow]")
+                        time.sleep(wait_time)
+                    elif attempt < max_retries - 1:
+                        wait_time = (2 ** attempt) * 5
+                        log(f"[DOWNLOAD] Error loading {hf_name}: {e}, retrying in {wait_time:.1f}s (attempt {attempt+1}/{max_retries})", 'warning')
+                        if self.is_main:
+                            console.print(f"[yellow]Error: {e}, retrying in {wait_time:.1f}s (attempt {attempt+1}/{max_retries})...[/yellow]")
+                        time.sleep(wait_time)
+                    else:
+                        log(f"[DOWNLOAD] FAILED to load {hf_name} after {max_retries} retries: {e}", 'error')
+                        raise
+            log(f"[DOWNLOAD] FAILED to load {hf_name} after {max_retries} retries", 'error')
+            raise Exception(f"Failed to load {hf_name} after {max_retries} retries")
 
         try:
+            log(f"[CHUNKED_LOAD] Starting chunked load for {name}, chunk_size={chunk_size_gb}GB, samples_per_chunk={samples_per_chunk}", 'info')
+
             if self.is_main:
                 console.print(f"[yellow]Loading {name} (chunked download mode, ~{chunk_size_gb:.0f}GB chunks)...[/yellow]")
 
-            # Helper function with retry logic
-            def load_with_retry(hf_name, max_retries=5, **kwargs):
-                for attempt in range(max_retries):
-                    try:
-                        return load_dataset(hf_name, **kwargs)
-                    except Exception as e:
-                        error_str = str(e).lower()
-                        if '429' in error_str or 'rate limit' in error_str or 'too many requests' in error_str:
-                            wait_time = (2 ** attempt) + random.uniform(0, 1)
-                            if self.is_main:
-                                console.print(f"[yellow]Rate limited, waiting {wait_time:.1f}s (attempt {attempt+1}/{max_retries})...[/yellow]")
-                            time.sleep(wait_time)
-                        else:
-                            raise
-                raise Exception(f"Failed to load {hf_name} after {max_retries} retries")
-
             # First, we need to get the total dataset size
-            # Load in streaming mode just to get info, then calculate chunks
+            # Only main process probes, then broadcasts via chunk_info file
             if chunk_info.get('total_samples') is None:
                 if self.is_main:
                     console.print(f"[cyan]Discovering dataset size (streaming probe)...[/cyan]")
+                    log(f"[CHUNKED_LOAD] Discovering total samples for {name}", 'info')
 
-                # Try to get dataset info without downloading
-                try:
-                    from datasets import load_dataset_builder
-                    builder_kwargs = {'trust_remote_code': True}
-                    if dataset_config['subset']:
-                        builder_kwargs['name'] = dataset_config['subset']
+                    # Try to get dataset info without downloading
+                    try:
+                        from datasets import load_dataset_builder
+                        builder_kwargs = {'trust_remote_code': True}
+                        if dataset_config['subset']:
+                            builder_kwargs['name'] = dataset_config['subset']
 
-                    builder = load_dataset_builder(dataset_config['hf_name'], **builder_kwargs)
-                    if hasattr(builder, 'info') and builder.info.splits:
-                        split_name = dataset_config['splits'][0]
-                        if split_name in builder.info.splits:
-                            total_samples = builder.info.splits[split_name].num_examples
-                            chunk_info['total_samples'] = total_samples
-                            chunk_info['samples_per_chunk'] = samples_per_chunk
-                            if self.is_main:
+                        builder = load_dataset_builder(dataset_config['hf_name'], **builder_kwargs)
+                        if hasattr(builder, 'info') and builder.info.splits:
+                            split_name = dataset_config['splits'][0]
+                            if split_name in builder.info.splits:
+                                total_samples = builder.info.splits[split_name].num_examples
+                                chunk_info['total_samples'] = total_samples
+                                chunk_info['samples_per_chunk'] = samples_per_chunk
                                 console.print(f"[green]Dataset has {total_samples:,} samples[/green]")
-                except Exception as e:
-                    if self.is_main:
+                                log(f"[CHUNKED_LOAD] {name} has {total_samples:,} total samples", 'info')
+                                # Save immediately so other ranks can read it
+                                self._save_chunk_info(name, chunk_info)
+                    except Exception as e:
                         console.print(f"[yellow]Could not get dataset info: {e}[/yellow]")
                         console.print(f"[yellow]Will discover size during first chunk download[/yellow]")
+                        log(f"[CHUNKED_LOAD] Could not get dataset info for {name}: {e}", 'warning')
+
+                # Sync after main discovers total samples
+                if self.is_distributed:
+                    log(f"[CHUNKED_LOAD] Rank {self.local_rank} waiting at barrier after total_samples discovery", 'debug')
+                    dist.barrier()
+                    log(f"[CHUNKED_LOAD] Rank {self.local_rank} passed barrier after total_samples discovery", 'debug')
+
+                # Non-main ranks reload chunk_info from file
+                if not self.is_main:
+                    chunk_info = self._get_chunk_info(name)
+                    log(f"[CHUNKED_LOAD] Rank {self.local_rank} loaded chunk_info: total_samples={chunk_info.get('total_samples')}", 'debug')
 
             total_samples = chunk_info.get('total_samples')
             current_chunk = chunk_info.get('current_chunk', 0)
@@ -2401,14 +2496,76 @@ class MultiGPUPseudoLabelGenerator:
             kwargs = {
                 'split': split_slice,
                 'trust_remote_code': True,
+                # CRITICAL: Enable download resume for partial downloads
+                # 'reuse_cache_if_exists' will reuse already downloaded files
+                # and resume interrupted downloads from where they left off
+                'download_mode': 'reuse_cache_if_exists',
             }
             if dataset_config['subset']:
                 kwargs['name'] = dataset_config['subset']
 
-            if self.is_main:
-                console.print(f"[yellow]Downloading chunk (this may take a while)...[/yellow]")
+            # Add cache_dir from config if available (ensures consistent cache location)
+            if hasattr(self, 'config') and self.config.get('paths', {}).get('hf_cache'):
+                kwargs['cache_dir'] = self.config['paths']['hf_cache']
 
-            dataset = load_with_retry(dataset_config['hf_name'], **kwargs)
+            # =================================================================
+            # CRITICAL: RANK-0-FIRST DOWNLOAD PATTERN
+            # =================================================================
+            # This prevents NCCL timeouts by ensuring:
+            # 1. Rank 0 downloads the data first (populates HuggingFace cache)
+            # 2. All other ranks wait at a barrier
+            # 3. Other ranks then load from the already-cached data (fast)
+            #
+            # Without this, all GPUs download simultaneously, and if one GPU's
+            # download is slow/stuck, other GPUs timeout waiting at NCCL barriers.
+            # =================================================================
+
+            dataset = None
+            chunk_sample_count = 0
+
+            if self.is_main:
+                console.print(f"[yellow]Rank 0 downloading chunk (other ranks waiting)...[/yellow]")
+                log(f"[CHUNKED_DOWNLOAD] Rank 0 starting download for {name} chunk {current_chunk}", 'info')
+
+                # Rank 0 downloads with extended timeout (30 min per attempt)
+                dataset = load_with_retry(dataset_config['hf_name'], max_retries=5, download_timeout=1800, **kwargs)
+                chunk_sample_count = len(dataset)
+
+                # Save chunk info so other ranks know the count
+                chunk_info['chunk_sample_count'] = chunk_sample_count
+                chunk_info['download_complete'] = True
+                self._save_chunk_info(name, chunk_info)
+
+                console.print(f"[green]✓ Rank 0 download complete: {chunk_sample_count:,} samples[/green]")
+                console.print(f"[cyan]Other ranks now loading from cache...[/cyan]")
+                log(f"[CHUNKED_DOWNLOAD] Rank 0 finished download: {chunk_sample_count} samples", 'info')
+
+            # Barrier: other ranks wait for rank 0 to finish downloading
+            if self.is_distributed:
+                log(f"[CHUNKED_DOWNLOAD] Rank {self.local_rank} waiting at barrier for rank 0 download", 'debug')
+                dist.barrier()
+                log(f"[CHUNKED_DOWNLOAD] Rank {self.local_rank} passed barrier after rank 0 download", 'debug')
+
+            # Non-main ranks load from cache (should be instant since rank 0 already downloaded)
+            if not self.is_main:
+                log(f"[CHUNKED_DOWNLOAD] Rank {self.local_rank} loading from cache for {name} chunk {current_chunk}", 'info')
+
+                # Reload chunk info to get the sample count
+                chunk_info = self._get_chunk_info(name)
+                chunk_sample_count = chunk_info.get('chunk_sample_count', 0)
+                log(f"[CHUNKED_DOWNLOAD] Rank {self.local_rank} expects {chunk_sample_count} samples from chunk_info", 'debug')
+
+                # Load from HuggingFace cache (data already downloaded by rank 0)
+                # Use shorter timeout since data should be cached
+                dataset = load_with_retry(dataset_config['hf_name'], max_retries=3, download_timeout=600, **kwargs)
+
+                log(f"[CHUNKED_DOWNLOAD] Rank {self.local_rank} loaded {len(dataset)} samples from cache", 'info')
+
+            # Final sync to ensure all ranks have loaded before processing
+            if self.is_distributed:
+                log(f"[CHUNKED_DOWNLOAD] Rank {self.local_rank} waiting at final sync barrier", 'debug')
+                dist.barrier()
+                log(f"[CHUNKED_DOWNLOAD] Rank {self.local_rank} passed final sync barrier, ready to process", 'debug')
 
             chunk_sample_count = len(dataset)
 
@@ -2454,9 +2611,12 @@ class MultiGPUPseudoLabelGenerator:
             return iter(dataset), chunk_sample_count, chunk_info
 
         except Exception as e:
+            log(f"[CHUNKED_LOAD] ERROR loading chunk for {name}: {e}", 'error')
             if self.is_main:
                 console.print(f"[red]✗ Error loading chunk for {name}: {e}[/red]")
                 import traceback
+                tb_str = traceback.format_exc()
+                log(f"[CHUNKED_LOAD] Traceback:\n{tb_str}", 'error')
                 traceback.print_exc()
             return None, None, chunk_info
 
@@ -2578,6 +2738,8 @@ class MultiGPUPseudoLabelGenerator:
         if not self.is_main:
             return
 
+        log(f"[CACHE_CLEANUP] Starting cache cleanup for {name}", 'info')
+
         try:
             from huggingface_hub import scan_cache_dir, HfFolder
             import shutil
@@ -2585,14 +2747,19 @@ class MultiGPUPseudoLabelGenerator:
             # Get HF cache directory
             cache_dir = os.environ.get('HF_HOME', os.path.expanduser('~/.cache/huggingface'))
             datasets_cache = os.path.join(cache_dir, 'datasets')
+            log(f"[CACHE_CLEANUP] Checking cache directory: {datasets_cache}", 'debug')
 
             dataset_config = DATASET_CONFIGS.get(name)
             if not dataset_config:
+                log(f"[CACHE_CLEANUP] No config found for {name}, skipping", 'warning')
                 return
 
             hf_name = dataset_config['hf_name']
             # Convert HF name to cache directory format (replace / with ___)
             cache_name = hf_name.replace('/', '___')
+            log(f"[CACHE_CLEANUP] Looking for cache entries matching: {cache_name}", 'debug')
+
+            total_freed_gb = 0.0
 
             # Find and remove cached data for this dataset
             if os.path.exists(datasets_cache):
@@ -2607,23 +2774,31 @@ class MultiGPUPseudoLabelGenerator:
                                 for filename in filenames
                             ) / (1024**3)
 
+                            log(f"[CACHE_CLEANUP] Removing {item_path} (~{size_gb:.1f}GB)", 'info')
                             console.print(f"[yellow]Cleaning up cache for {name} (~{size_gb:.1f}GB)...[/yellow]")
                             shutil.rmtree(item_path)
+                            total_freed_gb += size_gb
                             console.print(f"[green]✓ Freed ~{size_gb:.1f}GB disk space[/green]")
+
+            log(f"[CACHE_CLEANUP] Total freed for {name}: {total_freed_gb:.1f}GB", 'info')
 
             # Also try to clean via HF API
             try:
+                log(f"[CACHE_CLEANUP] Attempting cleanup via HuggingFace API for {hf_name}", 'debug')
                 cache_info = scan_cache_dir()
                 for repo in cache_info.repos:
                     if hf_name in repo.repo_id:
                         for revision in repo.revisions:
                             # Delete specific revision
+                            log(f"[CACHE_CLEANUP] Deleting revision {revision.commit_hash} for {repo.repo_id}", 'debug')
                             delete_strategy = cache_info.delete_revisions(revision.commit_hash)
                             delete_strategy.execute()
-            except Exception:
+            except Exception as hf_e:
+                log(f"[CACHE_CLEANUP] HF API cleanup failed (non-critical): {hf_e}", 'debug')
                 pass  # HF cache API may not always work
 
         except Exception as e:
+            log(f"[CACHE_CLEANUP] WARNING: Cache cleanup failed for {name}: {e}", 'warning')
             if self.is_main:
                 console.print(f"[yellow]Cache cleanup warning: {e}[/yellow]")
                 console.print(f"[dim]  (This is non-critical, processing will continue)[/dim]")
@@ -2903,6 +3078,7 @@ class MultiGPUPseudoLabelGenerator:
 
             current_chunk = chunk_info.get('current_chunk', 0)
 
+            log(f"[CHUNKED_PROCESS] Starting chunk {current_chunk + 1} for {name}, samples={chunk_sample_count}", 'info')
             if self.is_main:
                 console.print(f"\n[bold yellow]Processing chunk {current_chunk + 1}...[/bold yellow]")
 
@@ -2915,8 +3091,11 @@ class MultiGPUPseudoLabelGenerator:
                 _total_samples_override=chunk_sample_count,
             )
 
+            log(f"[CHUNKED_PROCESS] Chunk {current_chunk + 1} processing complete, processed={chunk_progress.samples_processed}, accepted={chunk_progress.samples_accepted}", 'info')
+
             # Verify and cleanup the chunk
             if self.is_main:
+                log(f"[CHUNKED_PROCESS] Verifying chunk {current_chunk + 1}", 'info')
                 verification = self._verify_chunk_completion(
                     name=name,
                     chunk_idx=current_chunk,
@@ -2927,17 +3106,24 @@ class MultiGPUPseudoLabelGenerator:
 
                 if verification.get('verified', False):
                     # Chunk verified - mark complete and cleanup
+                    log(f"[CHUNKED_PROCESS] Chunk {current_chunk + 1} VERIFIED, marking complete and cleaning cache", 'info')
                     self._mark_chunk_completed(name, current_chunk)
                     self._cleanup_chunk_cache(name)
                 else:
                     # Verification failed - log and continue (dedup will handle on next run)
+                    log(f"[CHUNKED_PROCESS] Chunk {current_chunk + 1} verification INCOMPLETE, continuing anyway", 'warning')
                     console.print(f"[yellow]Chunk {current_chunk + 1} verification incomplete - continuing anyway[/yellow]")
                     console.print(f"[dim]Deduplication will handle any gaps on next run[/dim]")
                     self._mark_chunk_completed(name, current_chunk)
+                    # IMPORTANT: Still cleanup cache to free disk space even on incomplete verification
+                    # With 2TB disk limit, we must free space after each chunk
+                    self._cleanup_chunk_cache(name)
 
             # Sync GPUs before next chunk
             if self.is_distributed:
+                log(f"[CHUNKED_PROCESS] Rank {self.local_rank} waiting at inter-chunk barrier", 'debug')
                 dist.barrier()
+                log(f"[CHUNKED_PROCESS] Rank {self.local_rank} passed inter-chunk barrier", 'debug')
 
             # Update progress
             final_progress = chunk_progress
@@ -3731,11 +3917,39 @@ def main():
     if 'LOCAL_RANK' in os.environ:
         args.local_rank = int(os.environ['LOCAL_RANK'])
 
+    # Configure NCCL timeout BEFORE initializing process group
+    # This prevents NCCL watchdog from killing processes during slow downloads
+    # Default is 600s (10 min), we increase to 1800s (30 min) for large dataset downloads
+    nccl_timeout_seconds = int(os.environ.get('NCCL_TIMEOUT', 1800))
+    os.environ['NCCL_TIMEOUT'] = str(nccl_timeout_seconds)
+    # Also set the torch-specific timeout environment variable
+    os.environ['TORCH_NCCL_BLOCKING_WAIT'] = '1'
+
+    local_rank = int(os.environ.get('LOCAL_RANK', 0))
+    log(f"[INIT] Starting pseudo-label generation, local_rank={local_rank}", 'info')
+    log(f"[INIT] NCCL timeout configured: {nccl_timeout_seconds}s ({nccl_timeout_seconds // 60} min)", 'info')
+    log(f"[INIT] CUDA devices available: {torch.cuda.device_count()}", 'info')
+
     # Initialize distributed if available
     if torch.cuda.device_count() > 1 and not dist.is_initialized():
         try:
-            dist.init_process_group(backend='nccl')
-        except Exception:
+            # Use explicit timeout in init_process_group
+            from datetime import timedelta
+            log(f"[INIT] Initializing NCCL process group with timeout={nccl_timeout_seconds}s", 'info')
+            dist.init_process_group(
+                backend='nccl',
+                timeout=timedelta(seconds=nccl_timeout_seconds)
+            )
+            world_size = dist.get_world_size()
+            rank = dist.get_rank()
+            log(f"[INIT] NCCL initialized successfully: rank={rank}, world_size={world_size}", 'info')
+            if local_rank == 0:
+                console.print(f"[cyan]NCCL timeout set to {nccl_timeout_seconds}s ({nccl_timeout_seconds // 60} min)[/cyan]")
+                console.print(f"[cyan]Distributed: {world_size} GPUs initialized[/cyan]")
+        except Exception as e:
+            log(f"[INIT] WARNING: Could not initialize distributed: {e}", 'warning')
+            if local_rank == 0:
+                console.print(f"[yellow]Warning: Could not initialize distributed: {e}[/yellow]")
             pass
 
     is_main = not dist.is_initialized() or dist.get_rank() == 0
