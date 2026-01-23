@@ -2481,16 +2481,36 @@ class MultiGPUPseudoLabelGenerator:
                         console.print(f"[yellow]Will discover size during first chunk download[/yellow]")
                         log(f"[CHUNKED_LOAD] Could not get dataset info for {name}: {e}", 'warning')
 
-                # Sync after main discovers total samples
-                if self.is_distributed:
-                    log(f"[CHUNKED_LOAD] Rank {self.local_rank} waiting at barrier after total_samples discovery", 'debug')
-                    dist.barrier()
-                    log(f"[CHUNKED_LOAD] Rank {self.local_rank} passed barrier after total_samples discovery", 'debug')
+                # File-based sync after main discovers total samples
+                # Using file marker instead of NCCL barrier for robustness
+                info_marker = self.pseudo_labels_dir / f'{name}_info_ready.marker'
+                if self.is_main:
+                    info_marker.touch()
+                    log(f"[CHUNKED_LOAD] Rank 0 created info marker", 'debug')
+
+                if self.is_distributed and not self.is_main:
+                    # Wait for info marker with short timeout (metadata fetch is fast)
+                    max_info_wait = 120  # 2 minutes max for metadata
+                    info_waited = 0
+                    while not info_marker.exists() and info_waited < max_info_wait:
+                        time.sleep(1.0)
+                        info_waited += 1
+                    if info_marker.exists():
+                        log(f"[CHUNKED_LOAD] Rank {self.local_rank} detected info marker after {info_waited}s", 'debug')
+                    else:
+                        log(f"[CHUNKED_LOAD] Rank {self.local_rank} info marker timeout, proceeding anyway", 'warning')
 
                 # Non-main ranks reload chunk_info from file
                 if not self.is_main:
                     chunk_info = self._get_chunk_info(name)
                     log(f"[CHUNKED_LOAD] Rank {self.local_rank} loaded chunk_info: total_samples={chunk_info.get('total_samples')}", 'debug')
+
+                # Clean up info marker
+                if self.is_main and info_marker.exists():
+                    try:
+                        info_marker.unlink()
+                    except Exception:
+                        pass
 
             total_samples = chunk_info.get('total_samples')
             current_chunk = chunk_info.get('current_chunk', 0)
@@ -2540,42 +2560,80 @@ class MultiGPUPseudoLabelGenerator:
                 kwargs['cache_dir'] = self.config['paths']['hf_cache']
 
             # =================================================================
-            # CRITICAL: RANK-0-FIRST DOWNLOAD PATTERN
+            # CRITICAL: RANK-0-FIRST DOWNLOAD PATTERN WITH FILE-BASED SIGNALING
             # =================================================================
-            # This prevents NCCL timeouts by ensuring:
-            # 1. Rank 0 downloads the data first (populates HuggingFace cache)
-            # 2. All other ranks wait at a barrier
-            # 3. Other ranks then load from the already-cached data (fast)
+            # This prevents NCCL timeouts by using FILE-BASED signaling instead
+            # of NCCL barriers. The key insight is:
             #
-            # Without this, all GPUs download simultaneously, and if one GPU's
-            # download is slow/stuck, other GPUs timeout waiting at NCCL barriers.
+            # 1. NCCL barriers have a fixed timeout (even 30min is not enough for
+            #    large dataset downloads like GigaSpeech with 100+ files at 1GB each)
+            # 2. File-based signaling has NO timeout - other ranks poll indefinitely
+            # 3. Downloads can take HOURS without triggering NCCL watchdog kills
+            #
+            # Pattern:
+            # 1. Rank 0 downloads the data, writes a marker file when complete
+            # 2. Other ranks poll for marker file (no NCCL timeout possible)
+            # 3. Other ranks load from cache (instant, data already downloaded)
+            # 4. All ranks sync with NCCL barrier (fast, no download in progress)
             # =================================================================
 
             dataset = None
             chunk_sample_count = 0
 
-            if self.is_main:
-                console.print(f"[yellow]Rank 0 downloading chunk (other ranks waiting)...[/yellow]")
-                log(f"[CHUNKED_DOWNLOAD] Rank 0 starting download for {name} chunk {current_chunk}", 'info')
+            # Marker file for download completion signaling
+            download_marker = self.pseudo_labels_dir / f'{name}_chunk{current_chunk}_download_complete.marker'
 
-                # Rank 0 downloads with extended timeout (30 min per attempt)
-                dataset = load_with_retry(dataset_config['hf_name'], max_retries=5, download_timeout=1800, **kwargs)
+            if self.is_main:
+                # Remove stale marker from previous failed run
+                if download_marker.exists():
+                    download_marker.unlink()
+
+                console.print(f"[yellow]Rank 0 downloading chunk (other ranks waiting via file signal)...[/yellow]")
+                log(f"[CHUNKED_DOWNLOAD] Rank 0 starting download for {name} chunk {current_chunk}", 'info')
+                download_start = time.time()
+
+                # Rank 0 downloads with extended timeout (2 hours per attempt for large datasets)
+                dataset = load_with_retry(dataset_config['hf_name'], max_retries=5, download_timeout=7200, **kwargs)
                 chunk_sample_count = len(dataset)
+
+                download_elapsed = time.time() - download_start
 
                 # Save chunk info so other ranks know the count
                 chunk_info['chunk_sample_count'] = chunk_sample_count
                 chunk_info['download_complete'] = True
                 self._save_chunk_info(name, chunk_info)
 
-                console.print(f"[green]✓ Rank 0 download complete: {chunk_sample_count:,} samples[/green]")
-                console.print(f"[cyan]Other ranks now loading from cache...[/cyan]")
-                log(f"[CHUNKED_DOWNLOAD] Rank 0 finished download: {chunk_sample_count} samples", 'info')
+                # Create marker file to signal download is complete
+                download_marker.touch()
 
-            # Barrier: other ranks wait for rank 0 to finish downloading
-            if self.is_distributed:
-                log(f"[CHUNKED_DOWNLOAD] Rank {self.local_rank} waiting at barrier for rank 0 download", 'debug')
-                dist.barrier()
-                log(f"[CHUNKED_DOWNLOAD] Rank {self.local_rank} passed barrier after rank 0 download", 'debug')
+                console.print(f"[green]✓ Rank 0 download complete: {chunk_sample_count:,} samples in {download_elapsed/60:.1f} min[/green]")
+                console.print(f"[cyan]Other ranks now loading from cache...[/cyan]")
+                log(f"[CHUNKED_DOWNLOAD] Rank 0 finished download: {chunk_sample_count} samples in {download_elapsed:.1f}s", 'info')
+
+            # FILE-BASED WAIT: Other ranks poll for marker file (NO NCCL timeout!)
+            # This allows downloads to take hours without killing the process
+            if self.is_distributed and not self.is_main:
+                log(f"[CHUNKED_DOWNLOAD] Rank {self.local_rank} waiting for download marker file", 'info')
+                poll_interval = 10.0  # Check every 10 seconds
+                max_wait_hours = 12   # Allow up to 12 hours for very large downloads
+                max_wait_seconds = max_wait_hours * 3600
+                waited = 0
+                last_status_time = 0
+
+                while not download_marker.exists() and waited < max_wait_seconds:
+                    time.sleep(poll_interval)
+                    waited += poll_interval
+
+                    # Log progress every 5 minutes
+                    if waited - last_status_time >= 300:
+                        last_status_time = waited
+                        log(f"[CHUNKED_DOWNLOAD] Rank {self.local_rank} still waiting for download ({waited/60:.1f} min elapsed)", 'info')
+                        console.print(f"[dim]Rank {self.local_rank}: Waiting for Rank 0 download... ({waited/60:.0f} min)[/dim]")
+
+                if not download_marker.exists():
+                    raise RuntimeError(f"Rank {self.local_rank}: Timeout waiting for download after {max_wait_hours} hours")
+
+                log(f"[CHUNKED_DOWNLOAD] Rank {self.local_rank} detected download complete after {waited:.1f}s", 'info')
 
             # Non-main ranks load from cache (should be instant since rank 0 already downloaded)
             if not self.is_main:
@@ -2592,11 +2650,19 @@ class MultiGPUPseudoLabelGenerator:
 
                 log(f"[CHUNKED_DOWNLOAD] Rank {self.local_rank} loaded {len(dataset)} samples from cache", 'info')
 
-            # Final sync to ensure all ranks have loaded before processing
+            # Final sync: Now that ALL ranks have data loaded, use NCCL barrier
+            # This is fast because no download is happening - just a quick sync
             if self.is_distributed:
-                log(f"[CHUNKED_DOWNLOAD] Rank {self.local_rank} waiting at final sync barrier", 'debug')
+                log(f"[CHUNKED_DOWNLOAD] Rank {self.local_rank} at final sync barrier (all data loaded)", 'debug')
                 dist.barrier()
                 log(f"[CHUNKED_DOWNLOAD] Rank {self.local_rank} passed final sync barrier, ready to process", 'debug')
+
+            # Clean up marker file (main process only)
+            if self.is_main and download_marker.exists():
+                try:
+                    download_marker.unlink()
+                except Exception:
+                    pass  # Not critical if cleanup fails
 
             chunk_sample_count = len(dataset)
 
@@ -3120,9 +3186,22 @@ class MultiGPUPseudoLabelGenerator:
                         final_progress.error_message = f"Insufficient disk space (need {required_space:.0f}GB)"
                         return final_progress
 
-            # Sync after storage check
-            if self.is_distributed:
-                dist.barrier()
+            # File-based sync after storage check (avoids NCCL timeout on storage issues)
+            storage_marker = self.pseudo_labels_dir / f'{name}_storage_ready.marker'
+            if self.is_main:
+                storage_marker.touch()
+            if self.is_distributed and not self.is_main:
+                # Quick wait for storage check (should be fast)
+                waited = 0
+                while not storage_marker.exists() and waited < 60:
+                    time.sleep(1.0)
+                    waited += 1
+            # Clean up marker
+            if self.is_main and storage_marker.exists():
+                try:
+                    storage_marker.unlink()
+                except Exception:
+                    pass
 
             # Load the next chunk
             dataset_iter, chunk_sample_count, chunk_info = self._load_dataset_chunked(
@@ -3188,11 +3267,24 @@ class MultiGPUPseudoLabelGenerator:
                     # With 2TB disk limit, we must free space after each chunk
                     self._cleanup_chunk_cache(name)
 
-            # Sync GPUs before next chunk
-            if self.is_distributed:
-                log(f"[CHUNKED_PROCESS] Rank {self.local_rank} waiting at inter-chunk barrier", 'debug')
-                dist.barrier()
-                log(f"[CHUNKED_PROCESS] Rank {self.local_rank} passed inter-chunk barrier", 'debug')
+            # File-based sync between chunks (avoids NCCL timeout during cleanup)
+            chunk_sync_marker = self.pseudo_labels_dir / f'{name}_chunk{current_chunk}_sync.marker'
+            if self.is_main:
+                chunk_sync_marker.touch()
+                log(f"[CHUNKED_PROCESS] Rank 0 created chunk sync marker", 'debug')
+            if self.is_distributed and not self.is_main:
+                # Wait for main to finish cleanup (usually fast, but cleanup can take time)
+                waited = 0
+                while not chunk_sync_marker.exists() and waited < 300:  # 5 min max
+                    time.sleep(2.0)
+                    waited += 2
+                log(f"[CHUNKED_PROCESS] Rank {self.local_rank} detected chunk sync marker after {waited}s", 'debug')
+            # Clean up marker
+            if self.is_main and chunk_sync_marker.exists():
+                try:
+                    chunk_sync_marker.unlink()
+                except Exception:
+                    pass
 
             # Update progress
             final_progress = chunk_progress
