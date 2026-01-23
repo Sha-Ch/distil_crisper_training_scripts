@@ -206,6 +206,11 @@ def load_actual_sample_counts(pseudo_labels_dir: Path) -> dict:
                         'original_estimate': metadata.get('original_estimate', total),
                         'actual_iterated_count': actual_iterated_count,
                         'processed_count': total,  # Keep original processed count too
+                        # New fields for proper accounting
+                        'filtered_count': metadata.get('filtered_count', 0),
+                        'duration_rejected': metadata.get('duration_rejected', 0),
+                        'invalid_samples': metadata.get('invalid_samples', 0),
+                        'runtime_duplicates': metadata.get('runtime_duplicates', 0),
                     }
         except Exception:
             continue
@@ -395,11 +400,11 @@ def create_dataset_table(file_stats, progress_data, pseudo_labels_dir: Path):
 
     table.add_column("Dataset", justify="left", width=13)
     table.add_column("Progress", justify="left", width=22)
-    table.add_column("Processed", justify="right", width=12)
-    table.add_column("Remaining", justify="right", width=12)
+    table.add_column("Processed", justify="right", width=10)
+    table.add_column("Filtered", justify="right", width=10)
     table.add_column("Acc%", justify="right", width=5)
     table.add_column("WER", justify="right", width=5)
-    table.add_column("Status", justify="center", width=9)
+    table.add_column("Status", justify="center", width=10)
 
     # Dataset order by priority (matches 02_generate_pseudo_labels_multi_gpu.py)
     # 1=librispeech, 2=ami, 3=podcast_fillers, 4=voxpopuli, 5=common_voice,
@@ -418,6 +423,8 @@ def create_dataset_table(file_stats, progress_data, pseudo_labels_dir: Path):
     # Get best available estimates (actual counts from metadata when available)
     all_estimates = get_dataset_estimates(pseudo_labels_dir, file_stats, progress_data)
 
+    total_filtered = 0
+
     for name in dataset_order:
         # Use file_stats as source of truth (actual JSONL file contents)
         stats = file_stats.get(name, {'accepted': 0, 'rejected': 0, 'hours': 0, 'wer_sum': 0})
@@ -431,12 +438,16 @@ def create_dataset_table(file_stats, progress_data, pseudo_labels_dir: Path):
         processed = accepted + rejected
         estimated_total = estimates['samples']
 
+        # Get filtered counts from metadata (duration rejected, invalid, etc.)
+        filtered_count = estimates.get('filtered_count', 0)
+        duration_rejected = estimates.get('duration_rejected', 0)
+        invalid_samples = estimates.get('invalid_samples', 0)
+
         total_processed += processed
         total_estimated += estimated_total
         total_accepted += accepted
         total_hours += hours
-
-        remaining = max(0, estimated_total - processed)
+        total_filtered += filtered_count
 
         # Calculate rates
         acc_rate = (accepted / processed * 100) if processed > 0 else 0
@@ -449,13 +460,14 @@ def create_dataset_table(file_stats, progress_data, pseudo_labels_dir: Path):
 
         if status == 'completed':
             # Show verification status for completed datasets
+            # New status system: 'verified' = all accounted, 'incomplete' = unaccounted samples, 'exceeded' = more than expected
             if is_verified:
                 if verification_status == 'verified':
                     status_str = "[bold green]VERIFIED[/bold green]"
                 elif verification_status == 'exceeded':
                     status_str = "[cyan]DONE+[/cyan]"  # Exceeded expected
-                elif verification_status == 'missing_samples':
-                    status_str = "[yellow]DONE*[/yellow]"  # Some samples missing (likely deduped)
+                elif verification_status == 'incomplete':
+                    status_str = "[yellow]INCOMPLETE[/yellow]"  # Unaccounted samples (actual issue)
                 else:
                     status_str = "[green]DONE[/green]"
             else:
@@ -470,24 +482,29 @@ def create_dataset_table(file_stats, progress_data, pseudo_labels_dir: Path):
         else:
             status_str = "[dim]PENDING[/dim]"
 
-        # Progress bar
-        progress_bar = make_progress_bar(processed, estimated_total, width=15)
-        pct = (processed / estimated_total * 100) if estimated_total > 0 else 0
+        # Progress bar - now based on processed + filtered vs total
+        # This gives accurate progress since filtered samples are accounted for
+        accounted = processed + filtered_count
+        progress_bar = make_progress_bar(accounted, estimated_total, width=15)
+        pct = (accounted / estimated_total * 100) if estimated_total > 0 else 0
         # Show actual percentage (can exceed 100% if more samples than metadata predicted)
-        # This is informative - shows dataset iteration yielded more than len(dataset)
         if pct > 100:
             progress_str = f"{progress_bar} [cyan]{pct:4.1f}%[/cyan]"
         else:
             progress_str = f"{progress_bar} {pct:4.1f}%"
 
+        # Format filtered display
+        if filtered_count > 0:
+            filtered_display = f"[dim]{filtered_count:,}[/dim]"
+        else:
+            filtered_display = "[dim]-[/dim]"
+
         if processed > 0 or status == 'processing':
-            # If processed > estimated, show 0 remaining but indicate completion
-            remaining_display = f"[yellow]{remaining:,}[/yellow]" if remaining > 0 else "[green]0[/green]"
             table.add_row(
                 f"[bold]{name}[/bold]" if status == 'processing' else name,
                 progress_str,
                 f"[cyan]{processed:,}[/cyan]",
-                remaining_display,
+                filtered_display,
                 f"{acc_rate:.0f}%",
                 f"{avg_wer:.1f}%" if accepted > 0 else "-",
                 status_str
@@ -497,15 +514,15 @@ def create_dataset_table(file_stats, progress_data, pseudo_labels_dir: Path):
                 f"[dim]{name}[/dim]",
                 f"[dim]{progress_bar}   0%[/dim]",
                 "[dim]0[/dim]",
-                f"[dim]{estimated_total:,}[/dim]",
+                "[dim]-[/dim]",
                 "[dim]-[/dim]",
                 "[dim]-[/dim]",
                 status_str
             )
 
-    # Total row
-    total_pct = (total_processed / total_estimated * 100) if total_estimated > 0 else 0
-    total_remaining = max(0, total_estimated - total_processed)  # Don't show negative remaining
+    # Total row - use processed + filtered for accurate progress
+    total_accounted = total_processed + total_filtered
+    total_pct = (total_accounted / total_estimated * 100) if total_estimated > 0 else 0
     total_acc_rate = (total_accepted / total_processed * 100) if total_processed > 0 else 0
 
     # Format percentage - show cyan if exceeded expected
@@ -516,9 +533,9 @@ def create_dataset_table(file_stats, progress_data, pseudo_labels_dir: Path):
 
     table.add_row(
         "[bold]TOTAL[/bold]",
-        f"{make_progress_bar(total_processed, total_estimated, width=15)} {pct_str}",
+        f"{make_progress_bar(total_accounted, total_estimated, width=15)} {pct_str}",
         f"[bold cyan]{total_processed:,}[/bold cyan]",
-        f"[bold yellow]{total_remaining:,}[/bold yellow]" if total_remaining > 0 else "[bold green]0[/bold green]",
+        f"[dim]{total_filtered:,}[/dim]" if total_filtered > 0 else "[dim]-[/dim]",
         f"[bold]{total_acc_rate:.0f}%[/bold]",
         "",
         ""
