@@ -155,7 +155,7 @@ DATASET_CONFIGS = {
     'podcast_fillers': {
         'hf_name': 'ylacombe/podcast_fillers_by_license',
         'subset': None,
-        'splits': ['train'],
+        'splits': ['CC_BY_3.0', 'CC_BY_SA_3.0', 'CC_BY_ND_3.0'],  # Multiple license splits, not 'train'
         'text_column': 'text',
         'audio_column': 'audio',
         'estimated_hours': 145,
@@ -211,8 +211,9 @@ DATASET_CONFIGS = {
     },
 
     # Priority 6: TED talks - clear speech (TED-LIUM)
+    # Using distil-whisper/tedlium which has audio data readily available
     'tedlium': {
-        'hf_name': 'LIUM/tedlium',
+        'hf_name': 'distil-whisper/tedlium',
         'subset': 'release3',
         'splits': ['train'],
         'text_column': 'text',
@@ -1891,15 +1892,21 @@ class MultiGPUPseudoLabelGenerator:
 
             total_samples = None
 
-            # Special handling for LibriSpeech (multiple splits)
-            if name == 'librispeech':
+            # Special handling for datasets with multiple splits (LibriSpeech, podcast_fillers, etc.)
+            if len(dataset_config['splits']) > 1:
                 datasets_list = []
                 for split in dataset_config['splits']:
+                    kwargs = {
+                        'split': split,
+                        'streaming': use_streaming,
+                        'trust_remote_code': True,
+                    }
+                    if dataset_config['subset']:
+                        kwargs['name'] = dataset_config['subset']
+
                     ds = load_with_retry(
                         dataset_config['hf_name'],
-                        split=split,
-                        streaming=use_streaming,
-                        trust_remote_code=True,
+                        **kwargs,
                     )
                     datasets_list.append(ds)
                     # Small delay between split loads to avoid rate limiting
