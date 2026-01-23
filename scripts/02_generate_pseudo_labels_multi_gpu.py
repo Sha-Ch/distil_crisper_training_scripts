@@ -46,8 +46,15 @@ import sys
 # CRITICAL: Configure HuggingFace to resume partial downloads
 # Must be set BEFORE importing datasets/huggingface_hub
 # =============================================================================
-# Enable download resume for interrupted transfers
-os.environ.setdefault('HF_HUB_ENABLE_HF_TRANSFER', '1')  # Faster downloads with resume
+# Only enable hf_transfer if the package is installed (optional speedup)
+try:
+    import importlib.util
+    if importlib.util.find_spec('hf_transfer') is not None:
+        os.environ.setdefault('HF_HUB_ENABLE_HF_TRANSFER', '1')  # Faster downloads with resume
+    else:
+        os.environ.setdefault('HF_HUB_ENABLE_HF_TRANSFER', '0')  # Use standard downloads
+except Exception:
+    os.environ.setdefault('HF_HUB_ENABLE_HF_TRANSFER', '0')  # Use standard downloads
 os.environ.setdefault('HF_HUB_DOWNLOAD_TIMEOUT', '1800')  # 30 min timeout per file
 
 import json
