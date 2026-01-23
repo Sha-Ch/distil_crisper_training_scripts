@@ -1176,7 +1176,10 @@ class MultiGPUPseudoLabelGenerator:
         distil_config = self.config.get('distillation', {})
         pseudo_config = distil_config.get('pseudo_labels', {})
         self.wer_threshold = pseudo_config.get('wer_threshold', 0.10)
-        self.min_duration = 1.0  # Minimum audio duration in seconds
+        # Duration limits - matches original Distil-Whisper v3.5 methodology
+        # No minimum duration: short clips are allowed, WER filter catches hallucinations
+        # Max 30s: Whisper was trained on 30-second chunks
+        self.min_duration = 0.0  # No minimum (original distil-whisper has no min filter)
         self.max_duration = 30.0  # Maximum audio duration in seconds
 
         # Batch processing settings for GPU optimization
@@ -1622,29 +1625,36 @@ class MultiGPUPseudoLabelGenerator:
     def _verify_and_fill_missing_samples(
         self,
         name: str,
-        expected_total: Optional[int] = None
+        expected_total: Optional[int] = None,
+        duration_rejected: int = 0,
+        invalid_samples: int = 0,
+        runtime_duplicates: int = 0
     ) -> Dict[str, Any]:
         """
-        Verify dataset completion and identify any missing samples.
+        Verify dataset completion and report accurate status.
 
         This runs after initial processing to:
         1. Count unique samples processed (by ground_truth text)
         2. Compare against actual_iterated_count (true iterator count) from metadata
-        3. Report any discrepancy (missing or extra samples)
+        3. Account for filtered samples (duration, invalid, duplicates)
+        4. Report accurate completion status
 
-        For accurate verification, we prioritize actual_iterated_count (saved after first
-        complete iteration) over len(dataset) which can be inaccurate for concatenated datasets.
+        The verification is CORRECT when:
+            processed + duration_rejected + invalid + duplicates == total_fed
 
         Args:
             name: Dataset name
             expected_total: Expected total samples (fallback if metadata not available)
+            duration_rejected: Number of samples filtered by duration
+            invalid_samples: Number of invalid/corrupted samples
+            runtime_duplicates: Number of runtime duplicates caught
 
         Returns:
             Dict with verification results:
             - 'processed_count': Number of unique samples processed
             - 'expected_count': Expected total (if known)
-            - 'missing_count': Number potentially missing (expected - processed)
-            - 'status': 'verified', 'missing_samples', or 'exceeded'
+            - 'filtered_count': Number filtered (duration + invalid + duplicates)
+            - 'status': 'verified', 'incomplete', or 'exceeded'
         """
         if not self.is_main:
             return {}
@@ -1686,9 +1696,11 @@ class MultiGPUPseudoLabelGenerator:
                 pass
 
         # Use actual_iterated_count for verification if available (most accurate)
-        # Otherwise fall back to len(dataset) which may be inaccurate
         verification_count = actual_iterated_count if actual_iterated_count else len_dataset_count
         count_source = "iterator" if actual_iterated_count else "len(dataset)"
+
+        # Calculate filtered samples (these are EXPECTED to not be in output)
+        filtered_count = duration_rejected + invalid_samples + runtime_duplicates
 
         result = {
             'processed_count': processed_count,
@@ -1696,51 +1708,59 @@ class MultiGPUPseudoLabelGenerator:
             'expected_count': verification_count,
             'actual_iterated_count': actual_iterated_count,
             'len_dataset_count': len_dataset_count,
-            'missing_count': 0,
+            'filtered_count': filtered_count,
+            'duration_rejected': duration_rejected,
+            'invalid_samples': invalid_samples,
+            'runtime_duplicates': runtime_duplicates,
             'status': 'verified'
         }
 
-        # STEP 3: Determine verification status based on clean counts
+        # STEP 3: Determine verification status
+        # The KEY insight: processed + filtered should equal total_fed
+        # If they match, we've accounted for all samples = VERIFIED
         if verification_count is not None:
-            diff = processed_count - verification_count
+            accounted_for = processed_count + filtered_count
+            unaccounted = verification_count - accounted_for
 
-            if diff < 0:
-                # Fewer unique samples than expected - this is EXPECTED behavior
-                # The gap is not "missing" samples, but samples that were:
-                # 1. Text duplicates (same transcription, different audio) - deduplicated by design
-                # 2. Duration filtered (< 1s or > 30s)
-                # 3. Invalid/corrupted samples
-                result['missing_count'] = abs(diff)
-                gap_pct = abs(diff) / verification_count * 100 if verification_count else 0
-
-                # Only warn if gap is unusually large (> 50%)
-                if gap_pct > 50:
-                    result['status'] = 'missing_samples'
-                    console.print(f"[yellow]⚠ Verification: {processed_count:,} unique texts, "
-                                  f"expected {verification_count:,} samples ({gap_pct:.1f}% gap)[/yellow]")
-                    console.print(f"[yellow]  Large gap may indicate:[/yellow]")
-                    console.print(f"[yellow]    - Many duplicate transcriptions in dataset (common for meeting/filler datasets)[/yellow]")
-                    console.print(f"[yellow]    - Many samples filtered by duration (< {self.min_duration}s or > {self.max_duration}s)[/yellow]")
-                    console.print(f"[yellow]    - Dataset-specific issues (corrupted samples)[/yellow]")
-                else:
-                    result['status'] = 'verified'  # Small gap is expected
-                    console.print(f"[green]✓ Verification: {processed_count:,} unique texts from {verification_count:,} samples[/green]")
-                    console.print(f"[dim]  Gap of {abs(diff):,} ({gap_pct:.1f}%) is expected due to:[/dim]")
-                    console.print(f"[dim]    - Duplicate texts (same transcription, different audio)[/dim]")
-                    console.print(f"[dim]    - Duration filtering (< {self.min_duration}s or > {self.max_duration}s)[/dim]")
-                    console.print(f"[dim]    - Invalid samples skipped[/dim]")
-            elif diff > 0:
-                # More unique samples than expected (rare, but possible with dedup edge cases)
+            if unaccounted == 0:
+                # PERFECT - all samples accounted for
+                result['status'] = 'verified'
+                console.print(f"[green]✓ Verification PASSED: All {verification_count:,} samples accounted for[/green]")
+                console.print(f"[green]    Processed: {processed_count:,}[/green]")
+                if filtered_count > 0:
+                    console.print(f"[green]    Filtered:  {filtered_count:,} (duration: {duration_rejected:,}, invalid: {invalid_samples:,}, duplicates: {runtime_duplicates:,})[/green]")
+            elif unaccounted < 0:
+                # More accounted than expected (edge case with dedup)
                 result['status'] = 'exceeded'
-                console.print(f"[cyan]✓ Verification: {processed_count:,} unique samples processed, "
-                              f"expected {verification_count:,} from {count_source} (+{diff:,} extra)[/cyan]")
+                console.print(f"[cyan]✓ Verification: Accounted for {accounted_for:,} samples vs {verification_count:,} expected ({-unaccounted:,} extra)[/cyan]")
             else:
-                console.print(f"[green]✓ Verification: {processed_count:,} unique samples = expected {verification_count:,} from {count_source}[/green]")
+                # Some samples unaccounted - check if it's significant
+                unaccounted_pct = unaccounted / verification_count * 100 if verification_count else 0
 
-            # Show comparison between iterator count and len(dataset) if they differ
-            if actual_iterated_count and len_dataset_count and actual_iterated_count != len_dataset_count:
-                diff_counts = actual_iterated_count - len_dataset_count
-                console.print(f"[dim]  Note: Iterator yielded {actual_iterated_count:,} vs len(dataset)={len_dataset_count:,} ({diff_counts:+,})[/dim]")
+                if unaccounted_pct < 1:
+                    # Less than 1% unaccounted - likely rounding/timing edge cases
+                    result['status'] = 'verified'
+                    console.print(f"[green]✓ Verification PASSED: {accounted_for:,}/{verification_count:,} accounted ({unaccounted:,} minor variance)[/green]")
+                else:
+                    # Significant unaccounted samples
+                    result['status'] = 'incomplete'
+                    result['unaccounted'] = unaccounted
+                    console.print(f"[yellow]⚠ Verification: {unaccounted:,} samples unaccounted ({unaccounted_pct:.1f}%)[/yellow]")
+                    console.print(f"[yellow]    Total fed:   {verification_count:,}[/yellow]")
+                    console.print(f"[yellow]    Processed:   {processed_count:,}[/yellow]")
+                    console.print(f"[yellow]    Filtered:    {filtered_count:,}[/yellow]")
+                    console.print(f"[yellow]    Accounted:   {accounted_for:,}[/yellow]")
+
+            # Show breakdown
+            if filtered_count > 0:
+                filter_pct = filtered_count / verification_count * 100 if verification_count else 0
+                console.print(f"[dim]  Filter rate: {filter_pct:.1f}% ({filtered_count:,} of {verification_count:,})[/dim]")
+                if duration_rejected > 0:
+                    console.print(f"[dim]    - Duration (< {self.min_duration}s or > {self.max_duration}s): {duration_rejected:,}[/dim]")
+                if invalid_samples > 0:
+                    console.print(f"[dim]    - Invalid/corrupted: {invalid_samples:,}[/dim]")
+                if runtime_duplicates > 0:
+                    console.print(f"[dim]    - Runtime duplicates: {runtime_duplicates:,}[/dim]")
         else:
             console.print(f"[green]✓ Processed {processed_count:,} unique samples (no expected count to verify against)[/green]")
 
@@ -1757,6 +1777,10 @@ class MultiGPUPseudoLabelGenerator:
                 metadata['verified_at'] = datetime.now().isoformat()
                 metadata['unique_samples'] = processed_count
                 metadata['file_entries'] = file_count
+                metadata['filtered_count'] = filtered_count
+                metadata['duration_rejected'] = duration_rejected
+                metadata['invalid_samples'] = invalid_samples
+                metadata['runtime_duplicates'] = runtime_duplicates
                 metadata['verification_status'] = result['status']
                 with open(metadata_file, 'w') as f:
                     json.dump(metadata, f, indent=2)
@@ -3362,9 +3386,15 @@ class MultiGPUPseudoLabelGenerator:
         # Pass actual_iterated_count for accurate future verification
         self._update_metadata_with_actual_count(name, actual_iterated_count=total_samples_fed)
 
-        # Verify completion and check for missing samples
-        # This helps identify if deduplication caused any gaps
-        verification = self._verify_and_fill_missing_samples(name, total_samples)
+        # Verify completion with full accounting of filtered samples
+        # Pass the filter counts so verification can properly account for all samples
+        verification = self._verify_and_fill_missing_samples(
+            name=name,
+            expected_total=total_samples,
+            duration_rejected=duration_rejected,
+            invalid_samples=invalid_samples,
+            runtime_duplicates=runtime_duplicates_caught
+        )
 
         # Store verification results in progress
         if verification:
@@ -3438,11 +3468,12 @@ class MultiGPUPseudoLabelGenerator:
                         pass
 
                 if status == 'completed':
-                    # Check if we need to reprocess due to missing samples
-                    if verification_status == 'missing_samples':
+                    # Check if we need to reprocess due to incomplete processing
+                    # 'incomplete' means there are unaccounted samples (not just filtered ones)
+                    if verification_status == 'incomplete':
                         if self.is_main:
                             console.print(f"\n[bold yellow]{'═' * 50}[/bold yellow]")
-                            console.print(f"[bold yellow]  {name} has missing samples - reprocessing[/bold yellow]")
+                            console.print(f"[bold yellow]  {name} has unaccounted samples - reprocessing[/bold yellow]")
                             console.print(f"[bold yellow]{'═' * 50}[/bold yellow]")
                         # Don't skip - fall through to process_dataset
                     else:
