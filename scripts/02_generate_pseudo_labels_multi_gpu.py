@@ -1533,6 +1533,7 @@ class MultiGPUPseudoLabelGenerator:
         duration_rejected: int = 0,
         invalid_samples: int = 0,
         runtime_duplicates: int = 0,
+        skipped_already_processed: int = 0,
         samples_processed: int = 0
     ) -> None:
         """
@@ -1545,7 +1546,8 @@ class MultiGPUPseudoLabelGenerator:
             name: Dataset name
             duration_rejected: Samples filtered by duration
             invalid_samples: Corrupted/invalid samples
-            runtime_duplicates: Duplicate texts caught
+            runtime_duplicates: Duplicate texts caught within this run
+            skipped_already_processed: Samples skipped because text was already processed (dedup)
             samples_processed: Samples processed this run
         """
         if not self.is_main:
@@ -1562,11 +1564,17 @@ class MultiGPUPseudoLabelGenerator:
                 metadata = {'dataset': name}
 
             # Update filter stats
-            filtered_count = duration_rejected + invalid_samples + runtime_duplicates
+            # filtered_count = things that couldn't be processed (duration, invalid)
+            # text_duplicates = things skipped because same text already exists (dedup working correctly)
+            filtered_count = duration_rejected + invalid_samples
+            text_duplicates = skipped_already_processed + runtime_duplicates
+
             metadata['filtered_count'] = filtered_count
             metadata['duration_rejected'] = duration_rejected
             metadata['invalid_samples'] = invalid_samples
             metadata['runtime_duplicates'] = runtime_duplicates
+            metadata['skipped_already_processed'] = skipped_already_processed
+            metadata['text_duplicates'] = text_duplicates  # Total text dedup (previous + current run)
             metadata['samples_processed_this_run'] = samples_processed
             metadata['filter_stats_updated_at'] = datetime.now().isoformat()
 
@@ -3293,6 +3301,7 @@ class MultiGPUPseudoLabelGenerator:
                             duration_rejected=current_prefetch_stats.get('rejected_duration', 0),
                             invalid_samples=current_prefetch_stats.get('invalid_samples', 0),
                             runtime_duplicates=runtime_duplicates_caught,
+                            skipped_already_processed=current_prefetch_stats.get('skipped_in_loop', 0),
                             samples_processed=samples_this_run
                         )
 

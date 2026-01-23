@@ -211,6 +211,8 @@ def load_actual_sample_counts(pseudo_labels_dir: Path) -> dict:
                         'duration_rejected': metadata.get('duration_rejected', 0),
                         'invalid_samples': metadata.get('invalid_samples', 0),
                         'runtime_duplicates': metadata.get('runtime_duplicates', 0),
+                        'skipped_already_processed': metadata.get('skipped_already_processed', 0),
+                        'text_duplicates': metadata.get('text_duplicates', 0),  # Total text dedup
                     }
         except Exception:
             continue
@@ -401,7 +403,7 @@ def create_dataset_table(file_stats, progress_data, pseudo_labels_dir: Path):
     table.add_column("Dataset", justify="left", width=13)
     table.add_column("Progress", justify="left", width=22)
     table.add_column("Processed", justify="right", width=10)
-    table.add_column("Filtered", justify="right", width=10)
+    table.add_column("Deduped", justify="right", width=10)  # Text duplicates skipped
     table.add_column("Acc%", justify="right", width=5)
     table.add_column("WER", justify="right", width=5)
     table.add_column("Status", justify="center", width=10)
@@ -438,16 +440,15 @@ def create_dataset_table(file_stats, progress_data, pseudo_labels_dir: Path):
         processed = accepted + rejected
         estimated_total = estimates['samples']
 
-        # Get filtered counts from metadata (duration rejected, invalid, etc.)
-        filtered_count = estimates.get('filtered_count', 0)
-        duration_rejected = estimates.get('duration_rejected', 0)
-        invalid_samples = estimates.get('invalid_samples', 0)
+        # Get filtered/dedup counts from metadata
+        filtered_count = estimates.get('filtered_count', 0)  # duration + invalid
+        text_duplicates = estimates.get('text_duplicates', 0)  # skipped_already_processed + runtime_duplicates
 
         total_processed += processed
         total_estimated += estimated_total
         total_accepted += accepted
         total_hours += hours
-        total_filtered += filtered_count
+        total_filtered += (filtered_count + text_duplicates)  # Both filtered and deduped
 
         # Calculate rates
         acc_rate = (accepted / processed * 100) if processed > 0 else 0
@@ -482,9 +483,9 @@ def create_dataset_table(file_stats, progress_data, pseudo_labels_dir: Path):
         else:
             status_str = "[dim]PENDING[/dim]"
 
-        # Progress bar - now based on processed + filtered vs total
-        # This gives accurate progress since filtered samples are accounted for
-        accounted = processed + filtered_count
+        # Progress bar - based on processed + filtered + deduped vs total
+        # This gives accurate progress since all samples are accounted for
+        accounted = processed + filtered_count + text_duplicates
         progress_bar = make_progress_bar(accounted, estimated_total, width=15)
         pct = (accounted / estimated_total * 100) if estimated_total > 0 else 0
         # Show actual percentage (can exceed 100% if more samples than metadata predicted)
@@ -493,18 +494,21 @@ def create_dataset_table(file_stats, progress_data, pseudo_labels_dir: Path):
         else:
             progress_str = f"{progress_bar} {pct:4.1f}%"
 
-        # Format filtered display
-        if filtered_count > 0:
-            filtered_display = f"[dim]{filtered_count:,}[/dim]"
+        # Format deduped display (text duplicates skipped)
+        if text_duplicates > 0:
+            deduped_display = f"[dim]{text_duplicates:,}[/dim]"
+        elif filtered_count > 0:
+            # Show filtered if no text duplicates but some filtered
+            deduped_display = f"[dim]{filtered_count:,}*[/dim]"  # * indicates filtered, not deduped
         else:
-            filtered_display = "[dim]-[/dim]"
+            deduped_display = "[dim]-[/dim]"
 
         if processed > 0 or status == 'processing':
             table.add_row(
                 f"[bold]{name}[/bold]" if status == 'processing' else name,
                 progress_str,
                 f"[cyan]{processed:,}[/cyan]",
-                filtered_display,
+                deduped_display,
                 f"{acc_rate:.0f}%",
                 f"{avg_wer:.1f}%" if accepted > 0 else "-",
                 status_str
