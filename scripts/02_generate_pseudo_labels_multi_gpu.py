@@ -1527,6 +1527,56 @@ class MultiGPUPseudoLabelGenerator:
 
         return processed_count
 
+    def _update_realtime_filter_stats(
+        self,
+        name: str,
+        duration_rejected: int = 0,
+        invalid_samples: int = 0,
+        runtime_duplicates: int = 0,
+        samples_processed: int = 0
+    ) -> None:
+        """
+        Update metadata with real-time filter statistics during processing.
+
+        This allows the monitor to display filtered counts in real-time,
+        not just after processing completes.
+
+        Args:
+            name: Dataset name
+            duration_rejected: Samples filtered by duration
+            invalid_samples: Corrupted/invalid samples
+            runtime_duplicates: Duplicate texts caught
+            samples_processed: Samples processed this run
+        """
+        if not self.is_main:
+            return
+
+        metadata_file = self.pseudo_labels_dir / f'{name}_metadata.json'
+
+        try:
+            # Load existing metadata
+            if metadata_file.exists():
+                with open(metadata_file, 'r') as f:
+                    metadata = json.load(f)
+            else:
+                metadata = {'dataset': name}
+
+            # Update filter stats
+            filtered_count = duration_rejected + invalid_samples + runtime_duplicates
+            metadata['filtered_count'] = filtered_count
+            metadata['duration_rejected'] = duration_rejected
+            metadata['invalid_samples'] = invalid_samples
+            metadata['runtime_duplicates'] = runtime_duplicates
+            metadata['samples_processed_this_run'] = samples_processed
+            metadata['filter_stats_updated_at'] = datetime.now().isoformat()
+
+            with open(metadata_file, 'w') as f:
+                json.dump(metadata, f, indent=2)
+
+        except Exception as e:
+            # Don't fail processing if metadata update fails
+            log(f"[METADATA] Failed to update realtime filter stats for {name}: {e}", 'warning')
+
     def _save_dataset_metadata(
         self,
         name: str,
@@ -3234,6 +3284,17 @@ class MultiGPUPseudoLabelGenerator:
                 if progress.samples_processed % 500 == 0:
                     all_progress[name] = progress
                     self._save_progress(all_progress)
+
+                    # Update metadata with real-time filter stats (for monitor display)
+                    if self.is_main:
+                        current_prefetch_stats = prefetcher.get_stats()
+                        self._update_realtime_filter_stats(
+                            name=name,
+                            duration_rejected=current_prefetch_stats.get('rejected_duration', 0),
+                            invalid_samples=current_prefetch_stats.get('invalid_samples', 0),
+                            runtime_duplicates=runtime_duplicates_caught,
+                            samples_processed=samples_this_run
+                        )
 
                     # Invalidate cache so it gets rebuilt on next resume
                     # (simpler than incremental updates, and resume is now fast anyway)
