@@ -1115,14 +1115,16 @@ class CrisperWhisperTeacher:
         ).input_features.to(self.device, dtype=self.dtype)
 
         # Batched generation - SINGLE GPU call for entire batch!
-        # Note: max_new_tokens must be < 448 to leave room for decoder_input_ids
-        # (language token, task token, etc. = ~4 tokens)
+        # Matches original Distil-Whisper methodology:
+        # - num_beams=1 (greedy decoding) for speed, WER filter catches bad outputs
+        # - max_new_tokens=256 to match original max_label_length
         generated = self.model.generate(
             input_features,
             language=language,
             task="transcribe",
             return_timestamps=False,  # Skip timestamps for speed
-            max_new_tokens=440,
+            num_beams=1,  # Greedy decoding (original distil-whisper uses this)
+            max_new_tokens=256,  # Match original max_label_length
         )
 
         # Batch decode all transcriptions at once
