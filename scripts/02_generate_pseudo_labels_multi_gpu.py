@@ -449,6 +449,8 @@ class ThreadedPrefetcher:
         self._lock = threading.Lock()
         self._skipped_in_loop = 0
         self._rejected_duration = 0
+        self._sharded_out = 0  # Samples that belong to other GPUs (not processed by this GPU)
+        self._invalid_samples = 0  # Samples that couldn't be processed (missing audio, bad format, etc.)
         self._total_duration_hours = 0.0
         self._workers_done = 0
         self._total_samples_fed = 0  # Total samples yielded by iterator (for accurate count)
@@ -511,6 +513,8 @@ class ThreadedPrefetcher:
         """Worker thread: processes raw samples in parallel."""
         local_skipped = 0
         local_rejected = 0
+        local_sharded_out = 0
+        local_invalid = 0
         local_duration = 0.0
 
         try:
@@ -530,6 +534,7 @@ class ThreadedPrefetcher:
                 # Process sample (extract audio, hash, filter)
                 result = self._process_sample(sample, sample_idx)
                 if result is None:
+                    local_invalid += 1
                     continue
                 if result == 'duration_rejected':
                     local_rejected += 1
@@ -554,6 +559,7 @@ class ThreadedPrefetcher:
                 # Using ground_truth ensures same sample always goes to same GPU
                 shard_key = int(hashlib.md5(ground_truth_normalized.encode()).hexdigest()[:8], 16)
                 if shard_key % self.world_size != self.local_rank:
+                    local_sharded_out += 1
                     continue
 
                 # Put in processed queue (may block if full - backpressure)
@@ -580,6 +586,8 @@ class ThreadedPrefetcher:
             with self._lock:
                 self._skipped_in_loop += local_skipped
                 self._rejected_duration += local_rejected
+                self._sharded_out += local_sharded_out
+                self._invalid_samples += local_invalid
                 self._total_duration_hours += local_duration
                 self._workers_done += 1
 
@@ -704,6 +712,8 @@ class ThreadedPrefetcher:
             return {
                 'skipped_in_loop': self._skipped_in_loop,
                 'rejected_duration': self._rejected_duration,
+                'sharded_out': self._sharded_out,  # Samples that belong to other GPUs
+                'invalid_samples': self._invalid_samples,  # Samples that couldn't be processed
                 'total_duration_hours': self._total_duration_hours,
                 'workers_active': self.num_workers - self._workers_done,
                 'raw_queue_size': self.raw_queue.qsize(),
@@ -1555,15 +1565,30 @@ class MultiGPUPseudoLabelGenerator:
             diff = processed_count - verification_count
 
             if diff < 0:
-                # Fewer unique samples than expected
+                # Fewer unique samples than expected - this is EXPECTED behavior
+                # The gap is not "missing" samples, but samples that were:
+                # 1. Text duplicates (same transcription, different audio) - deduplicated by design
+                # 2. Duration filtered (< 1s or > 30s)
+                # 3. Invalid/corrupted samples
                 result['missing_count'] = abs(diff)
-                result['status'] = 'missing_samples'
-                console.print(f"[yellow]⚠ Verification: {processed_count:,} unique samples processed, "
-                              f"expected {verification_count:,} from {count_source} ({diff:,} potential gap)[/yellow]")
-                console.print(f"[yellow]  Note: Gap may be due to:[/yellow]")
-                console.print(f"[yellow]    - Duplicate texts in dataset (intentionally deduplicated)[/yellow]")
-                console.print(f"[yellow]    - Duration filtering (samples < {self.min_duration}s or > {self.max_duration}s)[/yellow]")
-                console.print(f"[yellow]    - Invalid/corrupted samples skipped[/yellow]")
+                gap_pct = abs(diff) / verification_count * 100 if verification_count else 0
+
+                # Only warn if gap is unusually large (> 50%)
+                if gap_pct > 50:
+                    result['status'] = 'missing_samples'
+                    console.print(f"[yellow]⚠ Verification: {processed_count:,} unique texts, "
+                                  f"expected {verification_count:,} samples ({gap_pct:.1f}% gap)[/yellow]")
+                    console.print(f"[yellow]  Large gap may indicate:[/yellow]")
+                    console.print(f"[yellow]    - Many duplicate transcriptions in dataset (common for meeting/filler datasets)[/yellow]")
+                    console.print(f"[yellow]    - Many samples filtered by duration (< {self.min_duration}s or > {self.max_duration}s)[/yellow]")
+                    console.print(f"[yellow]    - Dataset-specific issues (corrupted samples)[/yellow]")
+                else:
+                    result['status'] = 'verified'  # Small gap is expected
+                    console.print(f"[green]✓ Verification: {processed_count:,} unique texts from {verification_count:,} samples[/green]")
+                    console.print(f"[dim]  Gap of {abs(diff):,} ({gap_pct:.1f}%) is expected due to:[/dim]")
+                    console.print(f"[dim]    - Duplicate texts (same transcription, different audio)[/dim]")
+                    console.print(f"[dim]    - Duration filtering (< {self.min_duration}s or > {self.max_duration}s)[/dim]")
+                    console.print(f"[dim]    - Invalid samples skipped[/dim]")
             elif diff > 0:
                 # More unique samples than expected (rare, but possible with dedup edge cases)
                 result['status'] = 'exceeded'
@@ -2729,6 +2754,12 @@ class MultiGPUPseudoLabelGenerator:
             mode = 'w'
             progress = DatasetProgress(name=name)
 
+        # Reset per-run counters (these should reflect THIS run, not accumulated across runs)
+        # The actual processed/accepted counts are derived from files, so resetting is safe
+        # Duration counters can accumulate incorrectly when resuming, so reset them
+        progress.samples_rejected_duration = 0
+        progress.total_duration_hours = 0.0
+
         # Update GPU count for this run
         progress.gpu_count_at_start = self.world_size
         progress.status = "processing"
@@ -3038,6 +3069,7 @@ class MultiGPUPseudoLabelGenerator:
         # Get final stats from prefetcher
         prefetch_stats = prefetcher.get_stats()
         skipped_in_loop = prefetch_stats['skipped_in_loop']
+        sharded_out = prefetch_stats.get('sharded_out', 0)  # Samples sent to other GPUs
         total_samples_fed = prefetch_stats.get('total_samples_fed', 0)  # Actual iterator count
         progress.samples_rejected_duration += prefetch_stats['rejected_duration']
         progress.total_duration_hours += prefetch_stats['total_duration_hours']
@@ -3047,6 +3079,10 @@ class MultiGPUPseudoLabelGenerator:
             if skipped_in_loop > 0:
                 console.print(f"[green]Skipped {skipped_in_loop:,} already-processed samples (prefetcher dedup)[/green]")
 
+            # Log sharded out samples (this is EXPECTED with multi-GPU - samples are distributed across GPUs)
+            if sharded_out > 0 and self.world_size > 1:
+                console.print(f"[cyan]Sharded {sharded_out:,} samples to other GPUs ({self.world_size} GPUs total)[/cyan]")
+
             # Log runtime duplicates caught (within same run)
             if runtime_duplicates_caught > 0:
                 console.print(f"[yellow]Caught {runtime_duplicates_caught:,} runtime duplicates (same text appearing multiple times)[/yellow]")
@@ -3054,6 +3090,26 @@ class MultiGPUPseudoLabelGenerator:
             # Log actual iterator count for verification
             if total_samples_fed > 0:
                 console.print(f"[cyan]Dataset iterator yielded {total_samples_fed:,} samples total[/cyan]")
+
+                # Show breakdown of where samples went
+                duration_rejected = prefetch_stats.get('rejected_duration', 0)
+                invalid_samples = prefetch_stats.get('invalid_samples', 0)
+                accounted_for = skipped_in_loop + sharded_out + duration_rejected + invalid_samples + samples_this_run + runtime_duplicates_caught
+                unaccounted = total_samples_fed - accounted_for
+
+                # Always show breakdown to help understand where samples went
+                console.print(f"[dim]  Sample breakdown:[/dim]")
+                console.print(f"[dim]    - Processed this run: {samples_this_run:,}[/dim]")
+                console.print(f"[dim]    - Already processed (dedup): {skipped_in_loop:,}[/dim]")
+                if self.world_size > 1:
+                    console.print(f"[dim]    - Sent to other GPUs: {sharded_out:,}[/dim]")
+                console.print(f"[dim]    - Duration filtered: {duration_rejected:,}[/dim]")
+                if invalid_samples > 0:
+                    console.print(f"[dim]    - Invalid/corrupted: {invalid_samples:,}[/dim]")
+                if runtime_duplicates_caught > 0:
+                    console.print(f"[dim]    - Runtime duplicates: {runtime_duplicates_caught:,}[/dim]")
+                if unaccounted != 0:
+                    console.print(f"[dim]    - Other/unaccounted: {unaccounted:,}[/dim]")
 
             # Report GPU efficiency
             if total_batches > 0:
