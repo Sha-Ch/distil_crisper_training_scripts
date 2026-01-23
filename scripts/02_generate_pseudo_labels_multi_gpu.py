@@ -1222,6 +1222,30 @@ class MultiGPUPseudoLabelGenerator:
         # Spot instance handler
         self.spot_handler = SpotInstanceHandler(save_callback=self._emergency_save)
 
+        # Global deduplication and storage management
+        # These provide cross-dataset dedup, audio fingerprinting, and storage monitoring
+        try:
+            from dedup_utils import GlobalDeduplicator, StorageManager
+            self.global_deduplicator = GlobalDeduplicator(
+                cache_dir=self.pseudo_labels_dir,
+                enable_audio_fingerprinting=True,  # Catch near-duplicate audio
+            )
+            self.storage_manager = StorageManager(
+                cache_dir=str(Path(os.environ.get('HF_HOME', os.path.expanduser('~/.cache/huggingface')))),
+                output_dir=str(self.pseudo_labels_dir),
+                min_free_space_gb=50.0,  # Keep 50GB free
+                emergency_free_space_gb=20.0,  # Emergency cleanup at 20GB
+            )
+            self.use_global_dedup = True
+            if self.is_main:
+                console.print(f"[green]Global deduplication enabled ({self.global_deduplicator.processed_count:,} texts in cache)[/green]")
+                self.storage_manager.log_space_status()
+        except ImportError as e:
+            log(f"[INIT] dedup_utils not available: {e}. Using basic deduplication.", 'warning')
+            self.global_deduplicator = None
+            self.storage_manager = None
+            self.use_global_dedup = False
+
         # Calculate effective throughput
         effective_batch = self.batch_size * self.world_size
 
@@ -2901,6 +2925,26 @@ class MultiGPUPseudoLabelGenerator:
         sample_ids = [item[3] for item in batch_data]
         durations = [item[4] for item in batch_data]
 
+        # WITHIN-BATCH DUPLICATE DETECTION
+        # Check for duplicates within this batch (same text appearing multiple times)
+        if self.use_global_dedup and self.global_deduplicator:
+            batch_dupe_indices = self.global_deduplicator.check_batch_duplicates(ground_truths)
+            if batch_dupe_indices:
+                log(f"[GPU_BATCH] Found {len(batch_dupe_indices)} within-batch duplicates, removing", 'info')
+                # Remove duplicates from all lists (keep first occurrence)
+                keep_indices = [i for i in range(len(ground_truths)) if i not in batch_dupe_indices]
+                audio_arrays = [audio_arrays[i] for i in keep_indices]
+                sample_rates = [sample_rates[i] for i in keep_indices]
+                ground_truths = [ground_truths[i] for i in keep_indices]
+                sample_ids = [sample_ids[i] for i in keep_indices]
+                durations = [durations[i] for i in keep_indices]
+                sample_indices = [sample_indices[i] for i in keep_indices]
+                batch_data = [batch_data[i] for i in keep_indices]
+
+        if not batch_data:
+            log(f"[GPU_BATCH] All samples in batch were duplicates, returning empty", 'warning')
+            return []
+
         # Use the first sample rate (they should all be the same from HF datasets)
         sr = sample_rates[0]
 
@@ -3062,6 +3106,24 @@ class MultiGPUPseudoLabelGenerator:
         max_chunks = 1000  # Safety limit
 
         for chunk_iteration in range(max_chunks):
+            # Check storage space before downloading (only main process checks)
+            if self.is_main and self.storage_manager:
+                required_space = chunk_size_gb * 1.5  # 50% buffer for extraction/processing
+                if not self.storage_manager.check_and_cleanup_if_needed(required_space):
+                    console.print(f"[red]ERROR: Not enough disk space for chunk download![/red]")
+                    console.print(f"[yellow]Required: ~{required_space:.0f}GB, cleaning up and retrying...[/yellow]")
+                    # Try emergency cleanup
+                    self.storage_manager.emergency_cleanup()
+                    if not self.storage_manager.has_enough_space(required_space):
+                        console.print(f"[red]Still not enough space after cleanup. Stopping.[/red]")
+                        final_progress.status = "error"
+                        final_progress.error_message = f"Insufficient disk space (need {required_space:.0f}GB)"
+                        return final_progress
+
+            # Sync after storage check
+            if self.is_distributed:
+                dist.barrier()
+
             # Load the next chunk
             dataset_iter, chunk_sample_count, chunk_info = self._load_dataset_chunked(
                 name=name,
@@ -3411,6 +3473,7 @@ class MultiGPUPseudoLabelGenerator:
 
                 batch_written = 0
                 batch_deduped = 0
+                batch_cross_dataset_dupes = 0
                 for entry in entries:
                     # RUNTIME DEDUP CHECK: Catch duplicates within the same run
                     # The prefetcher checks already_processed_ids (from previous runs)
@@ -3421,6 +3484,24 @@ class MultiGPUPseudoLabelGenerator:
                         runtime_duplicates_caught += 1
                         batch_deduped += 1
                         continue
+
+                    # GLOBAL CROSS-DATASET DEDUP CHECK (if enabled)
+                    # This catches duplicates across different datasets (e.g., same audio in both
+                    # People's Speech and GigaSpeech, or TED talks in both TED-LIUM and YODAS)
+                    if self.use_global_dedup and self.global_deduplicator:
+                        # Note: We don't have the audio array here, so just check text
+                        # Audio fingerprinting happens during batch processing if needed
+                        is_dup, reason = self.global_deduplicator.check_and_add(
+                            ground_truth=entry.ground_truth,
+                            audio=None,  # Could pass audio if we stored it in entry
+                            dataset_name=name,
+                            sample_id=entry.sample_id,
+                        )
+                        if is_dup:
+                            batch_cross_dataset_dupes += 1
+                            batch_deduped += 1
+                            log(f"[GLOBAL_DEDUP] Cross-dataset duplicate: {reason[:50]}", 'debug')
+                            continue
 
                     # Mark as processed for this run
                     runtime_processed_texts.add(text_key)
@@ -3640,6 +3721,20 @@ class MultiGPUPseudoLabelGenerator:
                     console.print(f"[yellow]  Consider increasing prefetch_batches or num_workers[/yellow]")
                 else:
                     console.print(f"[green]✓ GPU efficiency: {100-starvation_rate:.1f}% (queue kept fed)[/green]")
+
+        # Log global deduplication stats (if enabled)
+        if self.use_global_dedup and self.global_deduplicator and self.is_main:
+            console.print(f"\n[bold cyan]Global Deduplication Statistics:[/bold cyan]")
+            self.global_deduplicator.log_stats()
+            stats = self.global_deduplicator.get_stats()
+            console.print(f"  Cross-dataset duplicates: {stats.cross_dataset_duplicates:,}")
+            console.print(f"  Near-audio duplicates:    {stats.near_audio_duplicates:,}")
+            # Save cache after each dataset
+            self.global_deduplicator.save_cache()
+
+        # Log storage status after processing
+        if self.storage_manager and self.is_main:
+            self.storage_manager.log_space_status()
 
         # Final save
         progress.status = "completed"
