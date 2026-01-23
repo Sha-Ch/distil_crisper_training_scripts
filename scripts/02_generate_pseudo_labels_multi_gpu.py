@@ -78,7 +78,78 @@ import logging
 logging.getLogger("transformers.generation.utils").setLevel(logging.ERROR)
 logging.getLogger("transformers.modeling_utils").setLevel(logging.ERROR)
 
+# =============================================================================
+# Logging Setup - Console + File
+# =============================================================================
+# All logs go to both console AND a timestamped log file in logs/ folder
+# Log directory: <workspace>/logs/ (works on Linux/Runpod)
+# =============================================================================
+
+def setup_logging(log_dir: Path = None):
+    """Setup logging to both console and file."""
+    if log_dir is None:
+        # Default to logs/ folder relative to script
+        log_dir = Path(__file__).resolve().parent.parent / 'logs'
+
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create timestamped log file
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_file = log_dir / f'pseudo_labels_{timestamp}.log'
+
+    # Setup file handler
+    file_handler = logging.FileHandler(log_file, encoding='utf-8')
+    file_handler.setLevel(logging.DEBUG)
+    file_formatter = logging.Formatter(
+        '%(asctime)s | %(levelname)-8s | %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    file_handler.setFormatter(file_formatter)
+
+    # Get the root logger for our app
+    logger = logging.getLogger('pseudo_labels')
+    logger.setLevel(logging.DEBUG)
+    # Prevent duplicate handlers on re-import
+    if not logger.handlers:
+        logger.addHandler(file_handler)
+
+    return logger, log_file
+
+# Initialize logger - logs/ folder next to scripts/
+LOG_DIR = Path(__file__).resolve().parent.parent / 'logs'
+logger, LOG_FILE = setup_logging(LOG_DIR)
+
+def log(message: str, level: str = 'info'):
+    """Log message to both console and file."""
+    # Log to file
+    if level == 'debug':
+        logger.debug(message)
+    elif level == 'warning':
+        logger.warning(message)
+    elif level == 'error':
+        logger.error(message)
+    else:
+        logger.info(message)
+
+# Rich console for pretty output
 console = Console()
+
+# Wrapper to log console output to file too
+_original_console_print = console.print
+def _logged_console_print(*args, **kwargs):
+    """Print to console and also log to file."""
+    # Convert rich markup to plain text for logging
+    from io import StringIO
+    string_io = StringIO()
+    temp_console = Console(file=string_io, force_terminal=False, no_color=True)
+    temp_console.print(*args, **kwargs)
+    plain_text = string_io.getvalue().strip()
+    if plain_text:
+        logger.info(plain_text)
+    # Also print to actual console
+    _original_console_print(*args, **kwargs)
+
+console.print = _logged_console_print
 
 # =============================================================================
 # HuggingFace Authentication Setup
@@ -475,47 +546,73 @@ class ThreadedPrefetcher:
     def _feeder_loop(self):
         """Feeder thread: iterates dataset and queues raw samples."""
         samples_fed = 0
+        samples_failed_queue = 0
+        log(f"[FEEDER] Starting feeder loop from idx={self.sample_idx}", 'debug')
         try:
             sample_idx = self.sample_idx
             for sample in self.dataset_iter:
                 if self.stop_event.is_set():
+                    log(f"[FEEDER] Stop event set at idx={sample_idx}, fed={samples_fed}", 'debug')
                     break
 
                 # Put raw sample with its index into queue
                 # Use timeout to avoid blocking forever if queue is full
+                put_attempts = 0
+                put_success = False
                 while not self.stop_event.is_set():
                     try:
                         self.raw_queue.put((sample, sample_idx), timeout=1.0)
                         samples_fed += 1
+                        put_success = True
+                        # Log every 10000 samples for progress tracking
+                        if samples_fed % 10000 == 0:
+                            log(f"[FEEDER] Progress: fed {samples_fed:,} samples, current idx={sample_idx}, queue_size={self.raw_queue.qsize()}", 'debug')
                         break
                     except:
+                        put_attempts += 1
+                        if put_attempts >= 30:  # 30 seconds timeout
+                            log(f"[FEEDER] WARNING: Queue put timeout at idx={sample_idx} after {put_attempts} attempts", 'warning')
+                            samples_failed_queue += 1
+                            break
                         continue  # Retry until stop or success
+
+                if not put_success and not self.stop_event.is_set():
+                    log(f"[FEEDER] FAILED to queue sample idx={sample_idx}", 'error')
+
                 sample_idx += 1
 
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"[FEEDER] Exception in feeder loop: {e}", 'error')
         finally:
             # Save total samples fed (for accurate count verification)
             with self._lock:
                 self._total_samples_fed = samples_fed
+            log(f"[FEEDER] Feeder complete: fed={samples_fed:,}, failed_queue={samples_failed_queue:,}, final_idx={sample_idx}", 'info')
             self.feeder_done.set()
             # Signal workers that no more raw samples are coming
             # Use timeout to avoid deadlock if queue is full
-            for _ in range(self.num_workers):
+            for i in range(self.num_workers):
                 while not self.stop_event.is_set():
                     try:
                         self.raw_queue.put(None, timeout=1.0)  # Poison pill
                         break
                     except:
                         continue
+            log(f"[FEEDER] All {self.num_workers} poison pills sent", 'debug')
 
     def _worker_loop(self):
         """Worker thread: processes raw samples in parallel."""
+        import threading
+        thread_name = threading.current_thread().name
         local_skipped = 0
         local_rejected = 0
         local_sharded_out = 0
         local_invalid = 0
+        local_processed = 0  # Successfully queued for GPU processing
+        local_dropped = 0  # Failed to queue (should never happen)
         local_duration = 0.0
+
+        log(f"[WORKER {thread_name}] Starting worker loop", 'debug')
 
         try:
             while not self.stop_event.is_set():
@@ -523,10 +620,12 @@ class ThreadedPrefetcher:
                     item = self.raw_queue.get(timeout=1.0)
                 except Empty:
                     if self.feeder_done.is_set() and self.raw_queue.empty():
+                        log(f"[WORKER {thread_name}] Exiting: feeder done and queue empty", 'debug')
                         break
                     continue
 
                 if item is None:  # Poison pill
+                    log(f"[WORKER {thread_name}] Received poison pill, exiting", 'debug')
                     break
 
                 sample, sample_idx = item
@@ -535,6 +634,9 @@ class ThreadedPrefetcher:
                 result = self._process_sample(sample, sample_idx)
                 if result is None:
                     local_invalid += 1
+                    # Log every 100th invalid to avoid spam but track issues
+                    if local_invalid % 100 == 1:
+                        log(f"[WORKER {thread_name}] Invalid sample idx={sample_idx} (total invalid: {local_invalid})", 'debug')
                     continue
                 if result == 'duration_rejected':
                     local_rejected += 1
@@ -565,22 +667,26 @@ class ThreadedPrefetcher:
                 # Put in processed queue (may block if full - backpressure)
                 # Retry with longer timeout to avoid dropping samples
                 put_success = False
+                put_attempts = 0
                 for _ in range(12):  # 12 * 5s = 60s max wait
                     if self.stop_event.is_set():
                         break
                     try:
                         self.processed_queue.put(result, timeout=5.0)
                         put_success = True
+                        local_processed += 1
                         break
                     except:
+                        put_attempts += 1
                         continue  # Retry
 
                 if not put_success and not self.stop_event.is_set():
-                    # Log dropped sample (shouldn't happen in normal operation)
-                    pass
+                    # Log dropped sample - THIS IS CRITICAL, SHOULD NEVER HAPPEN
+                    local_dropped += 1
+                    log(f"[WORKER {thread_name}] DROPPED sample idx={sample_idx} after {put_attempts} attempts! text='{ground_truth_normalized[:50]}...'", 'error')
 
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"[WORKER {thread_name}] Exception: {e}", 'error')
         finally:
             # Aggregate stats thread-safely
             with self._lock:
@@ -591,9 +697,13 @@ class ThreadedPrefetcher:
                 self._total_duration_hours += local_duration
                 self._workers_done += 1
 
+                # Log worker final stats
+                log(f"[WORKER {thread_name}] Final stats: processed={local_processed}, skipped={local_skipped}, rejected={local_rejected}, sharded={local_sharded_out}, invalid={local_invalid}, dropped={local_dropped}", 'info')
+
                 # If all workers done, signal exhausted
                 if self._workers_done >= self.num_workers:
                     self.exhausted.set()
+                    log(f"[WORKERS] All {self.num_workers} workers completed", 'info')
 
     def _process_sample(self, sample, sample_idx: int):
         """
@@ -608,14 +718,37 @@ class ThreadedPrefetcher:
             # Extract audio
             audio_data = sample.get(self.audio_col, {})
             if not isinstance(audio_data, dict):
+                # Log every 1000th to avoid spam but track the issue
+                if sample_idx % 1000 == 0:
+                    log(f"[PROCESS_SAMPLE] idx={sample_idx}: audio_data not dict, type={type(audio_data)}", 'debug')
+                return None
+
+            if 'array' not in audio_data:
+                if sample_idx % 1000 == 0:
+                    log(f"[PROCESS_SAMPLE] idx={sample_idx}: audio_data missing 'array' key, keys={list(audio_data.keys())}", 'debug')
+                return None
+
+            if 'sampling_rate' not in audio_data:
+                if sample_idx % 1000 == 0:
+                    log(f"[PROCESS_SAMPLE] idx={sample_idx}: audio_data missing 'sampling_rate' key", 'debug')
                 return None
 
             audio_array = np.array(audio_data['array'], dtype=np.float32)
             sr = audio_data['sampling_rate']
 
+            if len(audio_array) == 0:
+                log(f"[PROCESS_SAMPLE] idx={sample_idx}: empty audio array", 'debug')
+                return None
+
             # Get ground truth
             ground_truth = sample.get(self.text_col, '')
             if not ground_truth or not isinstance(ground_truth, str):
+                if sample_idx % 1000 == 0:
+                    log(f"[PROCESS_SAMPLE] idx={sample_idx}: invalid ground_truth, type={type(ground_truth)}, val='{str(ground_truth)[:30]}'", 'debug')
+                return None
+
+            if len(ground_truth.strip()) == 0:
+                log(f"[PROCESS_SAMPLE] idx={sample_idx}: empty ground_truth (whitespace only)", 'debug')
                 return None
 
             # Generate CONTENT-BASED sample ID (O(1) - only first 4000 samples)
@@ -626,11 +759,15 @@ class ThreadedPrefetcher:
 
             # Duration filter - return marker so we can track stats
             if duration < self.min_duration or duration > self.max_duration:
+                # Log details for duration filtering
+                if sample_idx % 5000 == 0:
+                    log(f"[PROCESS_SAMPLE] idx={sample_idx}: duration_rejected, dur={duration:.2f}s (min={self.min_duration}, max={self.max_duration})", 'debug')
                 return 'duration_rejected'
 
             return (audio_array, sr, ground_truth, sample_id, duration, sample_idx)
 
-        except Exception:
+        except Exception as e:
+            log(f"[PROCESS_SAMPLE] idx={sample_idx}: exception {type(e).__name__}: {e}", 'error')
             return None
 
     def get_batch(self, timeout: float = 30.0) -> List[Tuple]:
@@ -1067,6 +1204,9 @@ class MultiGPUPseudoLabelGenerator:
         effective_batch = self.batch_size * self.world_size
 
         if self.is_main:
+            # Log file location
+            console.print(f"\n[bold green]📝 Log file: {LOG_FILE}[/bold green]\n")
+
             console.print(Panel.fit(
                 f"[bold cyan]Multi-GPU Pseudo-Label Generator[/bold cyan]\n"
                 f"GPUs Available: {self.num_gpus_available}\n"
@@ -2481,7 +2621,12 @@ class MultiGPUPseudoLabelGenerator:
             List of PseudoLabelEntry objects
         """
         if not batch_data:
+            log(f"[GPU_BATCH] Empty batch received", 'debug')
             return []
+
+        batch_size = len(batch_data)
+        sample_indices = [item[5] for item in batch_data]
+        log(f"[GPU_BATCH] Processing batch of {batch_size} samples, indices={sample_indices[0]}-{sample_indices[-1]}", 'debug')
 
         # Unpack batch data
         audio_arrays = [item[0] for item in batch_data]
@@ -2495,14 +2640,35 @@ class MultiGPUPseudoLabelGenerator:
 
         # Preprocess audio arrays (resample if needed, convert to mono)
         processed_audios = []
-        for audio in audio_arrays:
-            # Convert to mono if stereo
-            if len(audio.shape) > 1:
-                audio = audio.mean(axis=1)
-            # Ensure float32
-            if audio.dtype != np.float32:
-                audio = audio.astype(np.float32)
-            processed_audios.append(audio)
+        preprocess_failed = 0
+        for i, audio in enumerate(audio_arrays):
+            try:
+                # Convert to mono if stereo
+                if len(audio.shape) > 1:
+                    audio = audio.mean(axis=1)
+                # Ensure float32
+                if audio.dtype != np.float32:
+                    audio = audio.astype(np.float32)
+                processed_audios.append(audio)
+            except Exception as e:
+                log(f"[GPU_BATCH] Audio preprocessing failed for idx={sample_indices[i]}: {e}", 'error')
+                preprocess_failed += 1
+                # Append None as placeholder to maintain alignment
+                processed_audios.append(None)
+
+        # Filter out failed preprocessing
+        valid_indices = [i for i, a in enumerate(processed_audios) if a is not None]
+        if len(valid_indices) < len(processed_audios):
+            log(f"[GPU_BATCH] {preprocess_failed} samples failed preprocessing, continuing with {len(valid_indices)}", 'warning')
+            processed_audios = [processed_audios[i] for i in valid_indices]
+            ground_truths = [ground_truths[i] for i in valid_indices]
+            sample_ids = [sample_ids[i] for i in valid_indices]
+            durations = [durations[i] for i in valid_indices]
+            sample_indices = [sample_indices[i] for i in valid_indices]
+
+        if not processed_audios:
+            log(f"[GPU_BATCH] All samples failed preprocessing, returning empty", 'error')
+            return []
 
         # BATCHED INFERENCE - single GPU call for entire batch!
         try:
@@ -2511,13 +2677,22 @@ class MultiGPUPseudoLabelGenerator:
                 sampling_rate=sr,
                 language="en",
             )
+            log(f"[GPU_BATCH] Inference complete: {len(transcriptions)} transcriptions for {len(processed_audios)} inputs", 'debug')
         except Exception as e:
+            log(f"[GPU_BATCH] Batch inference error: {e}", 'error')
             if self.is_main:
                 console.print(f"[dim red]Batch inference error: {e}[/dim red]")
             return []
 
+        # Verify alignment
+        if len(transcriptions) != len(ground_truths):
+            log(f"[GPU_BATCH] MISMATCH: {len(transcriptions)} transcriptions vs {len(ground_truths)} ground_truths", 'error')
+            return []
+
         # Create entries with WER calculation
         entries = []
+        accepted_count = 0
+        rejected_count = 0
         timestamp = datetime.now().isoformat()
 
         for i, (transcription, ground_truth, sample_id, duration) in enumerate(
@@ -2525,6 +2700,11 @@ class MultiGPUPseudoLabelGenerator:
         ):
             wer = self._calculate_wer(ground_truth, transcription)
             accepted = wer <= self.wer_threshold
+
+            if accepted:
+                accepted_count += 1
+            else:
+                rejected_count += 1
 
             entries.append(PseudoLabelEntry(
                 sample_id=sample_id,
@@ -2538,6 +2718,7 @@ class MultiGPUPseudoLabelGenerator:
                 rejection_reason=None if accepted else f"WER {wer:.2%} > {self.wer_threshold:.0%}"
             ))
 
+        log(f"[GPU_BATCH] Batch complete: {len(entries)} entries (accepted={accepted_count}, rejected_wer={rejected_count})", 'debug')
         return entries
 
     def process_dataset(
@@ -2702,6 +2883,10 @@ class MultiGPUPseudoLabelGenerator:
             _dataset_iter_override: Pre-loaded dataset iterator (for chunked mode)
             _total_samples_override: Pre-known sample count (for chunked mode)
         """
+        log(f"[PROCESS_DATASET] Starting processing for {name}", 'info')
+        log(f"[PROCESS_DATASET] Parameters: max_samples={max_samples}, resume={resume}, override={_dataset_iter_override is not None}", 'info')
+        log(f"[PROCESS_DATASET] GPU info: local_rank={self.local_rank}, world_size={self.world_size}", 'info')
+
         self._load_teacher()
 
         config = DATASET_CONFIGS.get(name)
@@ -2816,6 +3001,13 @@ class MultiGPUPseudoLabelGenerator:
         if self.is_main:
             console.print(f"[cyan]Using {num_prefetch_workers} prefetch threads ({num_cpu_cores} CPU cores available)[/cyan]")
 
+        # Log prefetcher configuration
+        log(f"[PREFETCHER] Creating prefetcher for {name}", 'info')
+        log(f"[PREFETCHER] Config: workers={num_prefetch_workers}, batch_size={self.batch_size}, prefetch_batches=16", 'info')
+        log(f"[PREFETCHER] Duration filter: min={self.min_duration}s, max={self.max_duration}s", 'info')
+        log(f"[PREFETCHER] Dedup: already_processed_ids={len(already_processed_ids):,}", 'info')
+        log(f"[PREFETCHER] Sharding: world_size={self.world_size}, local_rank={self.local_rank}", 'info')
+
         # Create threaded prefetcher for parallel sample loading
         # Uses content-based hashing for deduplication (order-independent!)
         # CRITICAL: prefetch_batches must be high enough to keep GPU fed continuously
@@ -2847,11 +3039,13 @@ class MultiGPUPseudoLabelGenerator:
         runtime_duplicates_caught = 0
 
         # Process samples with BATCHING using threaded prefetcher
+        log(f"[MAIN_LOOP] Starting main processing loop for {name}, mode={mode}", 'info')
         with open(output_file, mode) as out_f, open(rejected_file, mode) as rej_f:
             # Progress bar only on main process
             # Track actual processed count from files (accurate across all GPUs)
             if self.is_main:
                 initial_processed = self._count_processed_from_files(name)
+                log(f"[MAIN_LOOP] Initial processed from files: {initial_processed:,}", 'info')
                 pbar = tqdm(
                     desc=f"Processing {name} (GPU {self.local_rank}, batch={self.batch_size})",
                     total=pbar_total,  # Use actual count or estimate
@@ -2866,6 +3060,8 @@ class MultiGPUPseudoLabelGenerator:
             last_sample_idx = 0
             gpu_starvation_count = 0  # Track how often GPU had to wait for data
             total_batches = 0
+            total_entries_from_batches = 0  # Track total entries received from GPU batches
+            total_entries_written = 0  # Track total entries actually written to files
 
             # Main processing loop - pull batches from prefetcher
             empty_batch_count = 0  # Track consecutive empty batches for stuck detection
@@ -2887,6 +3083,7 @@ class MultiGPUPseudoLabelGenerator:
                     # No more data
                     should_exit = False
                     if prefetcher.is_exhausted():
+                        log(f"[MAIN_LOOP] Prefetcher exhausted after {total_batches} batches", 'info')
                         if self.is_main:
                             console.print(f"[green]Dataset {name} exhausted - all samples processed[/green]")
                         should_exit = True
@@ -2894,20 +3091,26 @@ class MultiGPUPseudoLabelGenerator:
                     # Track consecutive empty batches
                     if not should_exit:
                         empty_batch_count += 1
+                        if empty_batch_count % 5 == 0:
+                            stats = prefetcher.get_stats()
+                            log(f"[MAIN_LOOP] Empty batch #{empty_batch_count}, feeder_done={prefetcher.feeder_done.is_set()}, raw_q={stats['raw_queue_size']}, proc_q={stats['queue_size']}, workers={stats['workers_active']}", 'debug')
 
                         # Safety: If we've gotten 10+ empty batches in a row and feeder is done,
                         # the workers may have all finished but exhausted flag not set due to race
                         if empty_batch_count >= 10 and prefetcher.feeder_done.is_set():
                             if self.is_main:
                                 console.print(f"[yellow]Warning: {empty_batch_count} empty batches, feeder done - checking exhaustion[/yellow]")
+                            log(f"[MAIN_LOOP] {empty_batch_count} empty batches with feeder done, checking exhaustion", 'warning')
                             # Give workers a moment to finish and set exhausted flag
                             time.sleep(2.0)
                             if prefetcher.is_exhausted() or (prefetcher.processed_queue.empty() and prefetcher.raw_queue.empty()):
                                 if self.is_main:
                                     console.print(f"[green]Dataset {name} processing complete (detected via empty queues)[/green]")
+                                log(f"[MAIN_LOOP] Dataset complete via empty queues check", 'info')
                                 should_exit = True
 
                     if should_exit:
+                        log(f"[MAIN_LOOP] Exiting loop: total_batches={total_batches}, entries_from_batches={total_entries_from_batches}, entries_written={total_entries_written}", 'info')
                         break
 
                     # Prevent busy loop - small sleep when no data
@@ -2923,7 +3126,14 @@ class MultiGPUPseudoLabelGenerator:
 
                 # Process batch on GPU
                 entries = self._process_batch_gpu(batch_data, name)
+                total_entries_from_batches += len(entries)
 
+                # Log periodically (every 100 batches)
+                if total_batches % 100 == 0:
+                    log(f"[MAIN_LOOP] Batch #{total_batches}: received {len(entries)} entries from batch of {len(batch_data)} samples", 'debug')
+
+                batch_written = 0
+                batch_deduped = 0
                 for entry in entries:
                     # RUNTIME DEDUP CHECK: Catch duplicates within the same run
                     # The prefetcher checks already_processed_ids (from previous runs)
@@ -2932,6 +3142,7 @@ class MultiGPUPseudoLabelGenerator:
                     if text_key in runtime_processed_texts:
                         # Duplicate! Skip writing to avoid bloating output files
                         runtime_duplicates_caught += 1
+                        batch_deduped += 1
                         continue
 
                     # Mark as processed for this run
@@ -2955,6 +3166,12 @@ class MultiGPUPseudoLabelGenerator:
                     progress.samples_processed += 1
                     progress.last_sample_id = entry.sample_id
                     samples_this_run += 1
+                    batch_written += 1
+                    total_entries_written += 1
+
+                # Log batch details if any were deduped
+                if batch_deduped > 0:
+                    log(f"[MAIN_LOOP] Batch #{total_batches}: wrote {batch_written}, deduped {batch_deduped}", 'debug')
 
                 # Track last sample index from batch
                 if batch_data:
@@ -3071,8 +3288,29 @@ class MultiGPUPseudoLabelGenerator:
         skipped_in_loop = prefetch_stats['skipped_in_loop']
         sharded_out = prefetch_stats.get('sharded_out', 0)  # Samples sent to other GPUs
         total_samples_fed = prefetch_stats.get('total_samples_fed', 0)  # Actual iterator count
-        progress.samples_rejected_duration += prefetch_stats['rejected_duration']
+        duration_rejected = prefetch_stats.get('rejected_duration', 0)
+        invalid_samples = prefetch_stats.get('invalid_samples', 0)
+        progress.samples_rejected_duration += duration_rejected
         progress.total_duration_hours += prefetch_stats['total_duration_hours']
+
+        # LOG DETAILED FINAL STATS TO FILE
+        log(f"[FINAL_STATS] Dataset: {name}", 'info')
+        log(f"[FINAL_STATS] total_samples_fed={total_samples_fed:,}", 'info')
+        log(f"[FINAL_STATS] samples_this_run={samples_this_run:,}", 'info')
+        log(f"[FINAL_STATS] total_entries_from_batches={total_entries_from_batches:,}", 'info')
+        log(f"[FINAL_STATS] total_entries_written={total_entries_written:,}", 'info')
+        log(f"[FINAL_STATS] skipped_in_loop (already processed)={skipped_in_loop:,}", 'info')
+        log(f"[FINAL_STATS] sharded_out (other GPUs)={sharded_out:,}", 'info')
+        log(f"[FINAL_STATS] duration_rejected={duration_rejected:,}", 'info')
+        log(f"[FINAL_STATS] invalid_samples={invalid_samples:,}", 'info')
+        log(f"[FINAL_STATS] runtime_duplicates_caught={runtime_duplicates_caught:,}", 'info')
+        log(f"[FINAL_STATS] total_batches={total_batches}", 'info')
+        log(f"[FINAL_STATS] gpu_starvation_count={gpu_starvation_count}", 'info')
+
+        # Calculate accounting
+        accounted_for = skipped_in_loop + sharded_out + duration_rejected + invalid_samples + samples_this_run + runtime_duplicates_caught
+        unaccounted = total_samples_fed - accounted_for if total_samples_fed > 0 else 0
+        log(f"[FINAL_STATS] accounted_for={accounted_for:,}, unaccounted={unaccounted:,}", 'info')
 
         # Log resume stats and GPU efficiency
         if self.is_main:
@@ -3087,29 +3325,23 @@ class MultiGPUPseudoLabelGenerator:
             if runtime_duplicates_caught > 0:
                 console.print(f"[yellow]Caught {runtime_duplicates_caught:,} runtime duplicates (same text appearing multiple times)[/yellow]")
 
-            # Log actual iterator count for verification
-            if total_samples_fed > 0:
-                console.print(f"[cyan]Dataset iterator yielded {total_samples_fed:,} samples total[/cyan]")
-
-                # Show breakdown of where samples went
-                duration_rejected = prefetch_stats.get('rejected_duration', 0)
-                invalid_samples = prefetch_stats.get('invalid_samples', 0)
-                accounted_for = skipped_in_loop + sharded_out + duration_rejected + invalid_samples + samples_this_run + runtime_duplicates_caught
-                unaccounted = total_samples_fed - accounted_for
-
-                # Always show breakdown to help understand where samples went
-                console.print(f"[dim]  Sample breakdown:[/dim]")
-                console.print(f"[dim]    - Processed this run: {samples_this_run:,}[/dim]")
-                console.print(f"[dim]    - Already processed (dedup): {skipped_in_loop:,}[/dim]")
-                if self.world_size > 1:
-                    console.print(f"[dim]    - Sent to other GPUs: {sharded_out:,}[/dim]")
-                console.print(f"[dim]    - Duration filtered: {duration_rejected:,}[/dim]")
-                if invalid_samples > 0:
-                    console.print(f"[dim]    - Invalid/corrupted: {invalid_samples:,}[/dim]")
-                if runtime_duplicates_caught > 0:
-                    console.print(f"[dim]    - Runtime duplicates: {runtime_duplicates_caught:,}[/dim]")
-                if unaccounted != 0:
-                    console.print(f"[dim]    - Other/unaccounted: {unaccounted:,}[/dim]")
+            # ALWAYS show full breakdown
+            console.print(f"\n[bold cyan]═══ SAMPLE ACCOUNTING FOR {name.upper()} ═══[/bold cyan]")
+            console.print(f"  Total from iterator:     {total_samples_fed:,}")
+            console.print(f"  Processed this run:      {samples_this_run:,}")
+            console.print(f"  Already processed:       {skipped_in_loop:,}")
+            console.print(f"  Sharded to other GPUs:   {sharded_out:,}")
+            console.print(f"  Duration filtered:       {duration_rejected:,}")
+            console.print(f"  Invalid/corrupted:       {invalid_samples:,}")
+            console.print(f"  Runtime duplicates:      {runtime_duplicates_caught:,}")
+            console.print(f"  ─────────────────────────────────")
+            console.print(f"  Accounted for:           {accounted_for:,}")
+            console.print(f"  (Batches→Entries→Written: {total_batches}→{total_entries_from_batches:,}→{total_entries_written:,})")
+            if unaccounted != 0:
+                console.print(f"[red bold]  UNACCOUNTED GAP:         {unaccounted:,}[/red bold]")
+                log(f"[FINAL_STATS] UNACCOUNTED GAP DETECTED: {unaccounted:,} samples", 'error')
+            else:
+                console.print(f"[green]  All samples accounted ✓[/green]")
 
             # Report GPU efficiency
             if total_batches > 0:
