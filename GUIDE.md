@@ -2,6 +2,12 @@
 
 Complete step-by-step guide for training a distilled CrisperWhisper model on cloud GPU.
 
+> **Running data prep / a PoC on one local RTX 4090 (Docker on WSL2)?** See
+> [LOCAL_4090.md](LOCAL_4090.md) and use `config.local.yaml`. Note: stage 2 now
+> persists accepted audio (`save_audio: true`) so stage 3 can train on real
+> features; the faithful v3.5 fidelity flags (timestamps, prev-context, BPE
+> dropout, `weight_decay: 0.0`) are wired in.
+
 ## Table of Contents
 1. [Prerequisites](#prerequisites)
 2. [Local Setup](#local-setup)

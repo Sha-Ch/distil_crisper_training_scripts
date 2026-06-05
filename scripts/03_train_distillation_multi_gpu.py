@@ -73,6 +73,9 @@ from rich.panel import Panel
 from rich.table import Table
 from huggingface_hub import HfApi, create_repo
 
+# Torch-free helpers (unit-tested in tests/test_distill_seq_utils.py)
+from distill_seq_utils import build_decoder_inputs_and_labels, pad_decoder_batch
+
 warnings.filterwarnings('ignore')
 console = Console()
 
@@ -232,11 +235,18 @@ class DistillationDataset(Dataset):
     """
     Dataset for distillation training using pre-generated pseudo-labels.
 
-    Features:
-    - Loads pseudo-labels from JSONL file
-    - Processes audio on-the-fly
-    - Supports sample packing to 30 seconds
-    - Preserves word-level timestamp information
+    Faithful distil-whisper v3.5 training inputs:
+    - Loads REAL audio from `audio_path` (written by stage 2 with save_audio: true).
+      Samples without on-disk audio are skipped at load time (no silent training
+      on zero-filled audio).
+    - timestamp_probability: a fraction of the time, train on the timestamped
+      pseudo-label (`pseudo_label_timestamped`) so the student learns to emit
+      Whisper-native segment timestamps.
+    - condition_on_prev_probability: a fraction of the time, prepend the previous
+      transcript (`prev_text`) as a decoder prompt.
+
+    __getitem__ returns token-id LISTS (prompt_ids, label_ids); the collator builds
+    padded decoder_input_ids/labels via build_decoder_inputs_and_labels().
     """
 
     def __init__(
@@ -246,106 +256,160 @@ class DistillationDataset(Dataset):
         max_audio_length: int = 480000,  # 30 seconds at 16kHz
         max_label_length: int = 448,
         sample_rate: int = 16000,
-        audio_dir: Optional[str] = None,
+        timestamp_probability: float = 0.0,
+        condition_on_prev_probability: float = 0.0,
     ):
         self.processor = processor
         self.max_audio_length = max_audio_length
         self.max_label_length = max_label_length
         self.sample_rate = sample_rate
-        self.audio_dir = Path(audio_dir) if audio_dir else None
+        self.timestamp_probability = timestamp_probability
+        self.condition_on_prev_probability = condition_on_prev_probability
 
-        # Load pseudo-labels
-        self.samples = []
         console.print(f"[yellow]Loading pseudo-labels from {pseudo_labels_path}...[/yellow]")
-
+        loaded = []
         with open(pseudo_labels_path, 'r') as f:
             for line in f:
                 try:
                     entry = json.loads(line)
                     if entry.get('accepted', True):
-                        self.samples.append(entry)
+                        loaded.append(entry)
                 except json.JSONDecodeError:
                     continue
 
-        console.print(f"[green]Loaded {len(self.samples):,} training samples[/green]")
+        # Training requires REAL audio on disk. Stage 2 must have been run with
+        # distillation.pseudo_labels.save_audio: true (the default). We drop any
+        # accepted entry whose audio is missing rather than fabricate silence.
+        self.samples = [
+            s for s in loaded
+            if s.get('audio_path') and Path(s['audio_path']).exists()
+        ]
+        dropped = len(loaded) - len(self.samples)
+
+        if not self.samples:
+            console.print("[red]No training samples have audio on disk.[/red]")
+            console.print(
+                "[yellow]Re-run stage 2 (02_generate_pseudo_labels_multi_gpu.py) with "
+                "distillation.pseudo_labels.save_audio: true so audio is persisted.[/yellow]"
+            )
+            raise RuntimeError("No audio available for training (audio_path missing).")
+
+        if dropped:
+            console.print(f"[yellow]Skipped {dropped:,} accepted samples without audio on disk[/yellow]")
+        console.print(f"[green]Loaded {len(self.samples):,} training samples (with audio)[/green]")
 
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        sample = self.samples[idx]
-
-        # Get the pseudo-label text (what CrisperWhisper generated)
-        text = sample.get('pseudo_label', sample.get('ground_truth', ''))
-
-        # For streaming datasets, we need to handle audio differently
-        # Option 1: Audio path stored in sample
-        # Option 2: Re-fetch from dataset (slower but works for streaming)
-
-        audio_path = sample.get('audio_path')
-        if audio_path and Path(audio_path).exists():
-            audio_array, sr = sf.read(audio_path)
-        else:
-            # For streaming, we create a dummy audio
-            # In production, you'd want to cache audio to disk
-            duration = sample.get('duration_seconds', 10.0)
-            audio_array = np.zeros(int(duration * self.sample_rate), dtype=np.float32)
-            sr = self.sample_rate
-
-        # Ensure mono
-        if len(audio_array.shape) > 1:
+    def _load_audio(self, sample: Dict[str, Any]) -> np.ndarray:
+        """Load + normalize one sample's audio to 16kHz mono, padded/truncated to 30s."""
+        audio_array, sr = sf.read(sample['audio_path'])
+        if audio_array.ndim > 1:
             audio_array = audio_array.mean(axis=1)
-
-        # Ensure float32
         if audio_array.dtype != np.float32:
             audio_array = audio_array.astype(np.float32)
-
-        # Resample if necessary
         if sr != self.sample_rate:
             audio_tensor = torch.from_numpy(audio_array).unsqueeze(0).float()
-            resampler = torchaudio.transforms.Resample(sr, self.sample_rate)
-            audio_array = resampler(audio_tensor).squeeze(0).numpy()
-
-        # Pad or truncate to max length
+            audio_array = torchaudio.transforms.Resample(sr, self.sample_rate)(audio_tensor).squeeze(0).numpy()
         if len(audio_array) > self.max_audio_length:
             audio_array = audio_array[:self.max_audio_length]
         elif len(audio_array) < self.max_audio_length:
             audio_array = np.pad(audio_array, (0, self.max_audio_length - len(audio_array)))
+        return audio_array
 
-        # Process audio to mel spectrogram
+    def _encode_label(self, text: str, use_timestamps: bool) -> List[int]:
+        """
+        Tokenize transcript text WITH the Whisper special prefix/suffix.
+        When use_timestamps is True the prefix omits <|notimestamps|> and the
+        <|x.xx|> markers in `text` are encoded as timestamp tokens. Falls back to
+        plain (no-timestamp) tokenization on any error.
+        """
+        tok = self.processor.tokenizer
+        try:
+            tok.set_prefix_tokens(language="en", task="transcribe", predict_timestamps=use_timestamps)
+            ids = tok(text, add_special_tokens=True).input_ids
+            if ids:
+                return [int(x) for x in ids]
+        except Exception:
+            pass
+        try:
+            tok.set_prefix_tokens(language="en", task="transcribe", predict_timestamps=False)
+        except Exception:
+            pass
+        return [int(x) for x in tok(text, add_special_tokens=True).input_ids]
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        sample = self.samples[idx]
+        text_plain = sample.get('pseudo_label') or sample.get('ground_truth') or ''
+        text_ts = sample.get('pseudo_label_timestamped')
+
+        audio_array = self._load_audio(sample)
         input_features = self.processor.feature_extractor(
             audio_array,
             sampling_rate=self.sample_rate,
-            return_tensors="pt"
+            return_tensors="pt",
         ).input_features.squeeze(0)
 
-        # Process text to token IDs
-        labels = self.processor.tokenizer(
-            text,
-            return_tensors="pt",
-            padding="max_length",
-            max_length=self.max_label_length,
-            truncation=True,
-        ).input_ids.squeeze(0)
+        # timestamp_probability: occasionally train on the timestamped label.
+        use_ts = (
+            bool(text_ts)
+            and self.timestamp_probability > 0
+            and random.random() < self.timestamp_probability
+        )
+        label_ids = self._encode_label(text_ts if use_ts else text_plain, use_ts)
 
-        # Replace padding tokens with -100 for loss masking
-        labels[labels == self.processor.tokenizer.pad_token_id] = -100
+        # condition_on_prev_probability: occasionally prepend previous context.
+        prompt_ids: List[int] = []
+        prev_text = sample.get('prev_text')
+        if (
+            prev_text
+            and self.condition_on_prev_probability > 0
+            and random.random() < self.condition_on_prev_probability
+        ):
+            try:
+                pid = self.processor.tokenizer.get_prompt_ids(prev_text)
+                prompt_ids = [int(x) for x in pid]
+            except Exception:
+                prompt_ids = []
 
         return {
             'input_features': input_features,
-            'labels': labels,
+            'label_ids': label_ids,
+            'prompt_ids': prompt_ids,
         }
 
 
-def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
-    """Collate function for DataLoader."""
-    input_features = torch.stack([item['input_features'] for item in batch])
-    labels = torch.stack([item['labels'] for item in batch])
+class DistillationCollator:
+    """
+    Pads a batch and builds decoder_input_ids/labels via
+    build_decoder_inputs_and_labels(). decoder_input_ids are padded with
+    pad_token_id; labels with -100. No decoder_attention_mask is needed: padding
+    sits at the end and Whisper's decoder is causal, so it never affects the
+    supervised (earlier) positions.
+    """
 
-    return {
-        'input_features': input_features,
-        'labels': labels,
-    }
+    def __init__(self, pad_token_id: int, max_length: int = 448):
+        self.pad_token_id = pad_token_id
+        self.max_length = max_length
+
+    def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        input_features = torch.stack([item['input_features'] for item in batch])
+
+        dec_list, lab_list = [], []
+        for item in batch:
+            di, lb = build_decoder_inputs_and_labels(
+                item['prompt_ids'], item['label_ids'], self.max_length
+            )
+            dec_list.append(di)
+            lab_list.append(lb)
+
+        dec_padded, lab_padded = pad_decoder_batch(dec_list, lab_list, self.pad_token_id)
+
+        return {
+            'input_features': input_features,
+            'decoder_input_ids': torch.tensor(dec_padded, dtype=torch.long),
+            'labels': torch.tensor(lab_padded, dtype=torch.long),
+        }
 
 
 # =============================================================================
@@ -573,6 +637,8 @@ class DistillationTrainer:
         self.optimizer = None
         self.scheduler = None
         self.train_dataloader = None
+        self.eval_dataloader = None
+        self.eval_dataset = None
         self.loss_fn = None
 
         if self.accelerator.is_main_process:
@@ -615,6 +681,18 @@ class DistillationTrainer:
             teacher_config['model_id'],
             cache_dir=cache_dir,
         )
+
+        # BPE dropout (faithful v3.5 regularization). Best-effort: only the fast
+        # tokenizer's BPE backend supports it; if unavailable we log and continue.
+        bpe_dropout = float(self.config.get('distillation', {}).get('bpe_dropout', 0.0) or 0.0)
+        if bpe_dropout > 0:
+            try:
+                self.processor.tokenizer.backend_tokenizer.model.dropout = bpe_dropout
+                if self.accelerator.is_main_process:
+                    console.print(f"[green]✓ BPE dropout enabled: {bpe_dropout}[/green]")
+            except Exception as e:
+                if self.accelerator.is_main_process:
+                    console.print(f"[yellow]BPE dropout not applied (tokenizer unsupported): {e}[/yellow]")
 
         self.teacher_model = WhisperForConditionalGeneration.from_pretrained(
             teacher_config['model_id'],
@@ -662,10 +740,39 @@ class DistillationTrainer:
             console.print("[yellow]Run 02_generate_pseudo_labels_multi_gpu.py first[/yellow]")
             sys.exit(1)
 
-        train_dataset = DistillationDataset(
+        # Faithful v3.5 training-time augmentation probabilities
+        distil_config = self.config.get('distillation', {})
+        timestamp_probability = float(distil_config.get('timestamp_probability', 0.0) or 0.0)
+        condition_on_prev_probability = float(distil_config.get('condition_on_prev_probability', 0.0) or 0.0)
+        # Whisper's decoder positions cap at 448
+        max_label_length = min(int(distil_config.get('pseudo_labels', {}).get('max_label_length', 448) or 448), 448)
+
+        full_dataset = DistillationDataset(
             pseudo_labels_path=str(pseudo_labels_path),
             processor=self.processor,
+            max_label_length=max_label_length,
+            timestamp_probability=timestamp_probability,
+            condition_on_prev_probability=condition_on_prev_probability,
         )
+
+        # Hold out a small slice for periodic eval (overfitting signal). Capped to
+        # at most 10% so tiny PoC datasets keep enough training data.
+        eval_n = min(int(training_config.get('eval_samples', 0) or 0), len(full_dataset) // 10)
+        if eval_n > 0:
+            from torch.utils.data import Subset
+            n = len(full_dataset)
+            train_dataset = Subset(full_dataset, list(range(0, n - eval_n)))
+            self.eval_dataset = Subset(full_dataset, list(range(n - eval_n, n)))
+            if self.accelerator.is_main_process:
+                console.print(f"[cyan]Held out {eval_n:,} samples for eval[/cyan]")
+        else:
+            train_dataset = full_dataset
+            self.eval_dataset = None
+
+        pad_id = self.processor.tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = self.processor.tokenizer.eos_token_id
+        collator = DistillationCollator(pad_token_id=pad_id, max_length=max_label_length)
 
         self.train_dataloader = DataLoader(
             train_dataset,
@@ -673,8 +780,18 @@ class DistillationTrainer:
             shuffle=True,
             num_workers=training_config.get('dataloader_num_workers', 4),
             pin_memory=training_config.get('dataloader_pin_memory', True),
-            collate_fn=collate_fn,
+            collate_fn=collator,
         )
+
+        if self.eval_dataset is not None:
+            self.eval_dataloader = DataLoader(
+                self.eval_dataset,
+                batch_size=training_config['per_device_train_batch_size'],
+                shuffle=False,
+                num_workers=training_config.get('dataloader_num_workers', 4),
+                pin_memory=training_config.get('dataloader_pin_memory', True),
+                collate_fn=collator,
+            )
 
         # Setup scheduler
         num_training_steps = training_config['max_steps']
@@ -709,6 +826,9 @@ class DistillationTrainer:
             self.train_dataloader,
             self.scheduler,
         )
+
+        if self.eval_dataloader is not None:
+            self.eval_dataloader = self.accelerator.prepare(self.eval_dataloader)
 
         if self.accelerator.is_main_process:
             console.print("[green]✓ Training setup complete[/green]")
@@ -749,22 +869,45 @@ class DistillationTrainer:
         self._cleanup_checkpoints()
 
     def _load_checkpoint(self) -> bool:
-        """Load latest checkpoint."""
-        checkpoints = sorted(self.checkpoint_dir.glob('checkpoint-[0-9]*'))
-        if not checkpoints:
+        """
+        Resume from the most-advanced checkpoint (by saved global_step), including
+        the emergency checkpoint written on preemption.
+
+        Weights are loaded INTO the already-prepared student model rather than
+        replacing the object — replacing it would leave an unprepared, off-device
+        model whose parameters no longer match the optimizer.
+        """
+        candidates = list(self.checkpoint_dir.glob('checkpoint-[0-9]*'))
+        emergency = self.checkpoint_dir / 'checkpoint-emergency'
+        if emergency.exists() and (emergency / 'training_state.pt').exists():
+            candidates.append(emergency)
+        if not candidates:
             return False
 
-        checkpoint_path = checkpoints[-1]
+        def _step_of(p: Path) -> int:
+            state_path = p / 'training_state.pt'
+            try:
+                return int(torch.load(state_path, map_location='cpu').get('global_step', -1))
+            except Exception:
+                try:
+                    return int(p.name.split('-')[1])
+                except Exception:
+                    return -1
+
+        checkpoint_path = max(candidates, key=_step_of)
 
         if self.accelerator.is_main_process:
             console.print(f"[yellow]Loading checkpoint from {checkpoint_path}...[/yellow]")
 
-        # Load model
-        self.student_model = WhisperForConditionalGeneration.from_pretrained(checkpoint_path)
-        freeze_encoder(self.student_model)
+        # Load weights into the existing (prepared) student model, then re-freeze.
+        loaded = WhisperForConditionalGeneration.from_pretrained(checkpoint_path)
+        unwrapped = self.accelerator.unwrap_model(self.student_model)
+        unwrapped.load_state_dict(loaded.state_dict())
+        del loaded
+        freeze_encoder(unwrapped)
 
         # Load training state
-        state = torch.load(checkpoint_path / 'training_state.pt')
+        state = torch.load(checkpoint_path / 'training_state.pt', map_location='cpu')
         self.global_step = state['global_step']
         self.best_loss = state['best_loss']
         self.epoch = state['epoch']
@@ -814,6 +957,38 @@ class DistillationTrainer:
             console.print(f"[dim]Removing old checkpoint: {oldest}[/dim]")
             shutil.rmtree(oldest)
 
+    def _evaluate(self) -> Optional[float]:
+        """
+        Mean distillation loss over the held-out eval set (no grad, no augmentation).
+
+        Single-GPU: exact. Multi-GPU: each process averages its own shard and only
+        the main process logs, so the reported value is an approximation — fine as
+        an overfitting signal.
+        """
+        if self.eval_dataloader is None:
+            return None
+
+        self.student_model.eval()
+        self.spec_augment.eval()
+        total, count = 0.0, 0
+        with torch.no_grad():
+            for batch in self.eval_dataloader:
+                student_logits = self.student_model(
+                    input_features=batch['input_features'],
+                    decoder_input_ids=batch['decoder_input_ids'],
+                ).logits
+                teacher_logits = self.teacher_model(
+                    input_features=batch['input_features'],
+                    decoder_input_ids=batch['decoder_input_ids'],
+                ).logits
+                loss, _ = self.loss_fn(student_logits, teacher_logits, batch['labels'])
+                total += float(loss.detach().item())
+                count += 1
+        self.student_model.train()
+        self.spec_augment.train()
+
+        return (total / count) if count else None
+
     def train(self, resume: bool = False):
         """Main training loop."""
         self.setup()
@@ -825,6 +1000,7 @@ class DistillationTrainer:
         max_steps = training_config['max_steps']
         save_steps = training_config['save_steps']
         logging_steps = training_config['logging_steps']
+        eval_steps = int(training_config.get('eval_steps', 0) or 0)
 
         if self.accelerator.is_main_process:
             effective_batch = training_config['per_device_train_batch_size'] * self.accelerator.num_processes * self.gradient_accumulation_steps
@@ -853,27 +1029,28 @@ class DistillationTrainer:
                     return
 
                 with self.accelerator.accumulate(self.student_model):
-                    # Apply SpecAugment to input features
+                    # Apply SpecAugment to the STUDENT's input features only
                     input_features = batch['input_features']
                     if self.student_model.training:
                         input_features = self.spec_augment(input_features)
 
-                    # Student forward pass
-                    student_outputs = self.student_model(
+                    # Student forward pass. We pass explicit decoder_input_ids so
+                    # timestamp + prev-context conditioning are handled identically
+                    # for teacher and student (the loss uses the masked `labels`).
+                    student_logits = self.student_model(
                         input_features=input_features,
-                        labels=batch['labels'],
-                    )
-                    student_logits = student_outputs.logits
+                        decoder_input_ids=batch['decoder_input_ids'],
+                    ).logits
 
-                    # Teacher forward pass (no gradients, no augmentation)
+                    # Teacher forward pass (no gradients, clean/un-augmented features)
                     with torch.no_grad():
-                        teacher_outputs = self.teacher_model(
+                        teacher_logits = self.teacher_model(
                             input_features=batch['input_features'],
-                            labels=batch['labels'],
-                        )
-                        teacher_logits = teacher_outputs.logits
+                            decoder_input_ids=batch['decoder_input_ids'],
+                        ).logits
 
-                    # Compute distillation loss
+                    # Combined distillation loss. KL aligns position-by-position
+                    # because teacher & student share decoder_input_ids.
                     loss, loss_dict = self.loss_fn(
                         student_logits,
                         teacher_logits,
@@ -929,6 +1106,21 @@ class DistillationTrainer:
                 if self.global_step % save_steps == 0:
                     self._save_checkpoint()
 
+                # Periodic eval on the held-out slice (overfitting signal).
+                # Defensive: a failure here must never kill a long training run.
+                if eval_steps and self.eval_dataloader is not None and self.global_step % eval_steps == 0:
+                    try:
+                        eval_loss = self._evaluate()
+                        if eval_loss is not None:
+                            self.accelerator.log({'eval/loss': eval_loss}, step=self.global_step)
+                            if eval_loss < self.best_loss:
+                                self.best_loss = eval_loss
+                            if self.accelerator.is_main_process and pbar:
+                                pbar.write(f"[eval] step {self.global_step}: loss {eval_loss:.4f} (best {self.best_loss:.4f})")
+                    except Exception as e:
+                        if self.accelerator.is_main_process:
+                            console.print(f"[yellow]Eval skipped at step {self.global_step}: {e}[/yellow]")
+
                 if pbar:
                     pbar.update(1)
 
@@ -958,6 +1150,8 @@ def main():
     parser = argparse.ArgumentParser(description='Train distilled CrisperWhisper (Multi-GPU)')
     parser.add_argument('--config', type=str, default='config.yaml', help='Config file path')
     parser.add_argument('--resume', action='store_true', help='Resume from checkpoint')
+    parser.add_argument('--max-steps', type=int, default=None,
+                        help='Override training.max_steps (handy for a quick local PoC run)')
     args = parser.parse_args()
 
     # Find config file
@@ -974,6 +1168,10 @@ def main():
 
     # Start training
     trainer = DistillationTrainer(str(config_path))
+    if args.max_steps is not None:
+        # Override before train()->setup() so the LR scheduler uses the same horizon.
+        trainer.config['training']['max_steps'] = args.max_steps
+        console.print(f"[cyan]Overriding max_steps -> {args.max_steps} (PoC)[/cyan]")
     trainer.train(resume=args.resume)
 
 

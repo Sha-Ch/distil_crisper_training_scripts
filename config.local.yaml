@@ -1,0 +1,273 @@
+# =============================================================================
+# Distil-CrisperWhisper — LOCAL single-RTX-4090 config (Docker on WSL2)
+# =============================================================================
+# Same faithful distil-large-v3.5 recipe as config.yaml, retuned for ONE 24GB GPU.
+# Use with:  --config ../config.local.yaml
+#
+# Differences vs config.yaml (the cloud/multi-GPU config):
+#   - Single-GPU training batch (8) + larger grad-accum (PoC-friendly)
+#   - storage thresholds lowered for a smaller local disk (10 / 5 GB)
+#   - multi_gpu.min_gpus: 1
+#   - push_to_hub: false (enable + set HF_USERNAME if you want Hub pushes)
+#   - same fidelity flags: save_audio, generate_timestamps, timestamp/prev probs,
+#     bpe_dropout, weight_decay 0.0
+#
+# Paths are CONTAINER-INTERNAL (/workspace). docker-compose mounts a host data
+# directory onto /workspace, so everything persists on the host. See LOCAL_4090.md.
+#
+# Data scope: all 8 datasets are listed (full faithful mixture is supported via
+# chunked download). On one 4090 the giant sets (gigaspeech/peoples_speech/yodas)
+# take weeks-to-months — run the smaller ones first with, e.g.:
+#   accelerate launch 02_generate_pseudo_labels_multi_gpu.py \
+#       --config ../config.local.yaml --datasets librispeech ami tedlium
+# =============================================================================
+
+paths:
+  workspace: "/workspace"
+  data_dir: "/workspace/data"
+  checkpoint_dir: "/workspace/checkpoints"
+  output_dir: "/workspace/output"
+  hf_cache: "/workspace/hf_cache"
+  pseudo_labels_dir: "/workspace/pseudo_labels"
+
+# -----------------------------------------------------------------------------
+# Teacher Model (CrisperWhisper)
+# -----------------------------------------------------------------------------
+teacher:
+  model_id: "nyrahealth/CrisperWhisper"
+  dtype: "float16"
+  # Ceiling; stage 2 auto-tunes to ~12 for a 24GB 4090.
+  pseudo_label_batch_size: 64
+  attn_implementation: "sdpa"
+
+# -----------------------------------------------------------------------------
+# Batch Processing (stage-2 GPU optimization)
+# -----------------------------------------------------------------------------
+batch_processing:
+  audio_loader_workers: 8
+  dynamic_batching: false
+  max_batch_audio_seconds: 480
+  # Uncomment to override the auto-tuned pseudo-label batch size (after confirming
+  # VRAM headroom with nvidia-smi). Leave unset to use the safe auto value (~12).
+  # force_batch_size: 16
+
+# -----------------------------------------------------------------------------
+# Student Model (Distilled)
+# -----------------------------------------------------------------------------
+student:
+  base_model: "openai/whisper-large-v3"   # vestigial: student is built from the TEACHER's weights/tokenizer
+  # 8 decoder layers = ~3x speed, much closer WER parity (chosen).
+  # 2 = ~6x (faithful distil-v3.5), 16 = ~2x / max quality. Layers via np.linspace(0,31,n).
+  decoder_layers: 8
+  encoder_layers: 32         # full frozen encoder
+  dtype: "bfloat16"
+
+# -----------------------------------------------------------------------------
+# Datasets (full faithful mixture; English subsets). podcast_fillers intentionally
+# absent (no transcriptions). 'streaming' is read by stage 2; the giant sets use
+# chunked download (defined in DATASET_CONFIGS) regardless.
+# -----------------------------------------------------------------------------
+datasets:
+  librispeech:
+    enabled: true
+    name: "librispeech_asr"
+    subset: "all"
+    split: "train.clean.100+train.clean.360+train.other.500"
+    streaming: false
+    hours: 960
+    text_column: "text"
+
+  ami:
+    enabled: true
+    name: "edinburghcstr/ami"
+    subset: "ihm"
+    split: "train"
+    streaming: false
+    hours: 100
+    text_column: "text"
+    verbatim: true
+
+  tedlium:
+    enabled: true
+    name: "LIUM/tedlium"
+    subset: "release3"
+    split: "train"
+    streaming: false
+    hours: 450
+    text_column: "text"
+
+  voxpopuli:
+    enabled: true
+    name: "facebook/voxpopuli"
+    subset: "en"
+    split: "train"
+    streaming: false
+    hours: 1800
+    text_column: "normalized_text"
+
+  common_voice:
+    enabled: true
+    name: "mozilla-foundation/common_voice_17_0"
+    subset: "en"
+    split: "train"
+    streaming: false
+    hours: 3000
+    text_column: "sentence"
+
+  # ---- Giant sets: chunked download. Disable to skip on a small local disk. ----
+  gigaspeech:
+    enabled: true
+    name: "speechcolab/gigaspeech"
+    subset: "xl"
+    split: "train"
+    streaming: false
+    hours: 10000
+    text_column: "text"
+
+  peoples_speech:
+    enabled: true
+    name: "MLCommons/peoples_speech"
+    subset: "clean"
+    split: "train"
+    streaming: true
+    hours: 30000
+    text_column: "text"
+
+  yodas:
+    enabled: true
+    name: "espnet/yodas"
+    subset: "en000"
+    split: "train"
+    streaming: true
+    hours: 150000
+    text_column: "text"
+
+# -----------------------------------------------------------------------------
+# Training — single RTX 4090 (24GB). Effective batch = 8 * 16 = 128.
+# (Cloud multi-GPU uses config.yaml's larger batch; this is the local/PoC profile.)
+# -----------------------------------------------------------------------------
+training:
+  max_steps: 80000
+  per_device_train_batch_size: 8
+  gradient_accumulation_steps: 16
+  num_gpus: 1
+
+  learning_rate: 1.0e-4
+  lr_scheduler_type: "linear"
+  warmup_steps: 500
+
+  weight_decay: 0.0          # v3.5 uses no weight decay
+  max_grad_norm: 1.0
+
+  fp16: false
+  bf16: true
+
+  save_steps: 1000           # smaller than cloud (2500) for quicker local checkpoints
+  save_total_limit: 3
+
+  logging_steps: 25
+
+  eval_steps: 1000
+  eval_samples: 200          # held out for the periodic eval-loss signal
+
+  dataloader_num_workers: 6
+  dataloader_pin_memory: true
+  dataloader_prefetch_factor: 4
+
+  gradient_checkpointing: true
+
+# -----------------------------------------------------------------------------
+# Distillation — EXACT distil-whisper formula (verified against run_distillation.py)
+#   loss = 0.8 * CE + 1.0 * KL  (temperature 2.0, KL scaled by T^2)
+# -----------------------------------------------------------------------------
+distillation:
+  temperature: 2.0
+  ce_weight: 0.8
+  kl_weight: 1.0
+
+  timestamp_probability: 0.2
+  condition_on_prev_probability: 0.2
+  bpe_dropout: 0.1           # best-effort (fast tokenizer); set 0.0 to disable
+
+  pseudo_labels:
+    wer_threshold: 0.10
+    chunk_duration_seconds: 30
+    use_vad: true
+    return_timestamps: true
+    max_label_length: 256
+    save_audio: true         # REQUIRED so stage 3 has real audio to train on
+    audio_format: "flac"     # flac | wav (flac ~3-4x smaller)
+    generate_timestamps: true  # faithful; set false to speed up stage-2 generation
+
+# -----------------------------------------------------------------------------
+# SpecAugment (student input only)
+# -----------------------------------------------------------------------------
+spec_augment:
+  enabled: true
+  freq_mask_param: 27
+  n_freq_masks: 2
+  time_mask_param: 100
+  n_time_masks: 2
+  probability: 0.5
+
+# -----------------------------------------------------------------------------
+# HuggingFace Hub (off by default for local runs)
+# -----------------------------------------------------------------------------
+huggingface:
+  username: "${HF_USERNAME}"
+  repo_name: "distil-crisperwhisper-large-v3"
+  push_to_hub: false
+  push_every_n_steps: 2500
+  private: true
+
+# -----------------------------------------------------------------------------
+# Spot Instance / Preemption (harmless locally; Ctrl-C still saves a checkpoint)
+# -----------------------------------------------------------------------------
+spot_instance:
+  enabled: true
+  check_interval_seconds: 30
+  save_on_preemption: true
+  auto_resume: true
+
+# -----------------------------------------------------------------------------
+# Logging & Monitoring
+# -----------------------------------------------------------------------------
+logging:
+  use_wandb: false
+  wandb_project: "distil-crisperwhisper"
+  wandb_run_name: "local-4090"
+  use_tensorboard: true
+  tensorboard_dir: "/workspace/tensorboard"
+
+# -----------------------------------------------------------------------------
+# Single-GPU settings
+# -----------------------------------------------------------------------------
+multi_gpu:
+  use_accelerate: true
+  mixed_precision: "bf16"
+  deepspeed_config: null
+  nccl_debug: false
+  min_gpus: 1
+  max_gpus: 1
+
+# -----------------------------------------------------------------------------
+# Storage watchdog + chunked-download tuning (10 TiB local disk)
+# -----------------------------------------------------------------------------
+storage:
+  # Generous headroom on 10 TiB. The watchdog cleans the transient HF *download*
+  # cache (never your retained FLAC audio) when free space dips below these.
+  min_free_space_gb: 200.0
+  emergency_free_space_gb: 100.0
+  # Chunked-download size for the giant gated datasets (gigaspeech/peoples_speech/
+  # yodas). Bigger chunks = far FEWER HuggingFace requests (lower rate-limit risk)
+  # and less cache-cleanup churn. Overrides the per-dataset chunk_size_gb (20) in
+  # DATASET_CONFIGS. 10 TiB easily fits a 100GB rolling chunk (×1.5 working ≈ 150GB)
+  # plus retained audio. Lower it if you cap DATA_DIR well under 10 TiB.
+  chunk_size_gb: 100
+
+# -----------------------------------------------------------------------------
+# CTranslate2 Conversion
+# -----------------------------------------------------------------------------
+conversion:
+  quantization: "float16"
+  output_format: "ctranslate2"

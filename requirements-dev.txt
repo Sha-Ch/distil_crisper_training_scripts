@@ -1,0 +1,6 @@
+# Dev/test-only dependencies (NOT needed to run the pipeline).
+# These import-light tests run without torch/transformers/datasets:
+#   python -m pytest tests/ -q
+pytest>=7.0
+pyyaml>=6.0
+numpy>=1.26.0   # only for the content_hash test (torch-free)

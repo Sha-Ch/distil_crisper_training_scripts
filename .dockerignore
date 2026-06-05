@@ -1,0 +1,17 @@
+# Keep the Docker build context tiny. The Dockerfile does NOT COPY the repo (code
+# is bind-mounted at runtime), so nothing here is needed for the build — excluding
+# it just avoids shipping huge/irrelevant dirs to the daemon and bloating context.
+.git
+.venv
+venv
+_workspace
+**/__pycache__
+.pytest_cache
+*.pyc
+.idea
+.claude
+logs
+Server logs
+Backupserverdata
+*.zip
+.env

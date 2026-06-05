@@ -2,6 +2,10 @@
 
 Complete guide for training a distilled CrisperWhisper model on RunPod with **4x H100 NVL GPUs** following the **official distil-whisper v3.5 methodology**.
 
+> **Single local RTX 4090 instead of a cloud pod?** See [LOCAL_4090.md](LOCAL_4090.md)
+> (Docker on WSL2, `config.local.yaml`). The scripts auto-detect one GPU; full-scale
+> training (4096 batch / 80 epochs) remains a cloud multi-GPU job.
+
 ## Overview
 
 This setup will create a distilled CrisperWhisper model that:

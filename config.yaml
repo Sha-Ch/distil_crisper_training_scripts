@@ -95,11 +95,12 @@ student:
   base_model: "openai/whisper-large-v3"
 
   # Number of decoder layers in student (original has 32)
-  # Options:
-  #   2 layers  = 6x speedup (official distil-whisper-large-v3.5)
-  #   16 layers = 2x speedup but significantly better accuracy
-  # We use 2 to match official methodology
-  decoder_layers: 2
+  # Speed vs WER-parity trade (decoder layers selected via np.linspace(0,31,n)):
+  #   2 layers  = ~6x speedup (faithful distil-whisper-large-v3.5; ~1-2 WER pts behind teacher)
+  #   8 layers  = ~3x speedup, much closer WER parity   <-- CHOSEN (parity-vs-speed balance)
+  #   16 layers = ~2x speedup, near-parity / max quality
+  # NOTE: we deviate from distil-v3.5's 2 layers to 8 to better match CrisperWhisper WER.
+  decoder_layers: 8
 
   # Keep all encoder layers (32) - FROZEN during training
   # This is CRITICAL for:
@@ -162,21 +163,12 @@ datasets:
     verbatim: true  # Has filler words (um, uh)
 
   # ==========================================================================
-  # CRISPERWHISPER OFFICIAL FILLER DATASET
+  # NOTE: podcast_fillers REMOVED (reconciled with DATASET_CONFIGS in
+  # 02_generate_pseudo_labels_multi_gpu.py). ylacombe/podcast_fillers_by_license
+  # has only 199 full episodes with no transcriptions / non-commercial
+  # annotations, so it cannot produce pseudo-labels. Filler-word capability comes
+  # from AMI (verbatim transcripts with natural fillers) instead.
   # ==========================================================================
-  # PodcastFillers - Official CrisperWhisper dataset for filler word training
-  # Paper: "approximately 35,000 instances of filler words"
-  # Expanded to ~105,000 samples via context sampling
-  podcast_fillers:
-    enabled: true
-    name: "ylacombe/podcast_fillers_by_license"
-    subset: null
-    split: "train"
-    streaming: false  # DOWNLOAD - small dataset
-    hours: 145
-    text_column: "text"
-    verbatim: true  # Has filler words (um, uh)
-    has_filler_annotations: true
 
   # 5. TED-LIUM (450 hours) - ~25GB - TED talks
   tedlium:
@@ -259,8 +251,8 @@ training:
   lr_scheduler_type: "linear"  # Official uses linear, not cosine
   warmup_steps: 500  # Official uses 500 warmup steps
 
-  # Weight decay for regularization
-  weight_decay: 0.01
+  # Weight decay - official distil-whisper v3.5 uses 0.0 (no weight decay)
+  weight_decay: 0.0
 
   # Gradient clipping
   max_grad_norm: 1.0
@@ -311,6 +303,12 @@ distillation:
   # Official uses 0.2 (20%)
   condition_on_prev_probability: 0.2
 
+  # BPE dropout - faithful v3.5 regularization applied during tokenization.
+  # The exact rate is not published; 0.1 is a common value. Best-effort: only the
+  # fast tokenizer's BPE backend supports it (trainer logs if it can't be applied).
+  # Set to 0.0 to disable.
+  bpe_dropout: 0.1
+
   # Pseudo-label generation settings
   pseudo_labels:
     # WER threshold - official uses 10%
@@ -328,6 +326,19 @@ distillation:
 
     # Maximum label length (matching Whisper)
     max_label_length: 256
+
+    # --- Stage 2 audio persistence (REQUIRED for stage-3 training) ---
+    # Persist each ACCEPTED sample's 16kHz mono audio so the trainer loads real
+    # features instead of zero-filled silence. flac is ~3-4x smaller than wav.
+    save_audio: true
+    audio_format: "flac"   # flac | wav
+    # audio_dir: defaults to <pseudo_labels_dir>/audio when unset
+
+    # Faithful v3.5: generate pseudo-labels WITH Whisper-native segment timestamp
+    # tokens so the trainer's timestamp_probability has timestamped targets to use.
+    # Slower than timestamp-free generation; set false to maximize throughput
+    # (the trainer will then simply never see timestamped labels).
+    generate_timestamps: true
 
 # -----------------------------------------------------------------------------
 # SpecAugment Settings (Data Augmentation)
@@ -397,6 +408,15 @@ multi_gpu:
   # max_gpus: maximum GPUs to use (0 = use all available)
   min_gpus: 4
   max_gpus: 0  # Use all available GPUs
+
+# -----------------------------------------------------------------------------
+# Storage Management (chunked-download disk watchdog in stage 2)
+# -----------------------------------------------------------------------------
+# Defaults suit a large (2TB) cloud disk. On a local machine with less headroom,
+# lower these (see config.local.yaml: 10 / 5).
+storage:
+  min_free_space_gb: 50.0        # run cleanup below this much free space
+  emergency_free_space_gb: 20.0  # aggressive cleanup below this
 
 # -----------------------------------------------------------------------------
 # CTranslate2 Conversion Settings

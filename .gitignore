@@ -1,0 +1,26 @@
+# Secrets / local env (NEVER commit) ----------------------------------------
+.env
+
+# Local data volume mounted at /workspace ----------------------------------
+_workspace/
+
+# Python ---------------------------------------------------------------------
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# Editors / tooling ----------------------------------------------------------
+.idea/
+.claude/
+
+# Large local artifacts (never commit) --------------------------------------
+Backupserverdata/
+Server logs/
+*.zip
+
+# local scratchpad with secrets — never commit
+toDoList
+_nul

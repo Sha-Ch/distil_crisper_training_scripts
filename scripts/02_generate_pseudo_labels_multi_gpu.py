@@ -87,6 +87,16 @@ from rich.panel import Panel
 # Official Whisper text normalizer (matches distil-whisper methodology)
 from transformers.models.whisper.english_normalizer import EnglishTextNormalizer
 
+# Torch-free WER-gate + content-hash primitives (unit-tested in tests/test_wer_utils.py)
+from wer_utils import (
+    content_hash,
+    are_spelling_variants,
+    calculate_wer_spelling_tolerant,
+    is_all_caps_hallucination,
+    strip_bracketed_fillers,
+    drop_standalone_fillers,
+)
+
 # Suppress warnings - especially the noisy Whisper decoder warnings
 warnings.filterwarnings('ignore')
 # Specifically suppress the forced_decoder_ids and attention_mask warnings from transformers
@@ -235,24 +245,19 @@ DATASET_CONFIGS = {
         'has_fillers': True,
     },
 
-    # PodcastFillers - Filler word detection dataset
-    # ~35,000 filler instances (um, uh) with timing annotations
-    # CrisperWhisper expands this to ~105,000 samples via context sampling
-    # Source: https://huggingface.co/datasets/ylacombe/podcast_fillers_by_license
-    'podcast_fillers': {
-        'hf_name': 'ylacombe/podcast_fillers_by_license',
-        'subset': None,
-        'splits': ['CC_BY_3.0', 'CC_BY_SA_3.0', 'CC_BY_ND_3.0'],  # Multiple license splits, not 'train'
-        'text_column': 'text',
-        'audio_column': 'audio',
-        'estimated_hours': 145,
-        'requires_auth': False,
-        'priority': 3,  # High priority - explicit filler annotations
-        'quality': 'high',
-        'verbatim': True,
-        'has_fillers': True,
-        'filler_annotations': True,
-    },
+    # =========================================================================
+    # NOTE: podcast_fillers (ylacombe/podcast_fillers_by_license) REMOVED
+    # =========================================================================
+    # This dataset was removed because:
+    # 1. It only has 199 full podcast episodes (not 35K filler clips)
+    # 2. It does NOT include transcriptions or filler annotations
+    # 3. The annotations are under non-commercial license (not included)
+    # 4. Without transcriptions, we cannot generate pseudo-labels
+    #
+    # For filler word training, we rely on:
+    # - AMI corpus (has natural fillers in verbatim transcriptions)
+    # - Other datasets where CrisperWhisper can detect fillers during inference
+    # =========================================================================
 
     # =========================================================================
     # DISTIL-WHISPER v3.5 DATASETS (~196,000 hours)
@@ -382,6 +387,14 @@ class PseudoLabelEntry:
     audio_path: Optional[str] = None
     accepted: bool = True
     rejection_reason: Optional[str] = None
+    # --- Fidelity fields (distil-whisper v3.5 training-time augmentation) ---
+    # Pseudo-label WITH segment timestamp tokens (<|x.xx|>), produced when
+    # generate_timestamps is enabled. Used by the trainer's timestamp_probability
+    # (the student learns to emit Whisper-native segment timestamp tokens).
+    pseudo_label_timestamped: Optional[str] = None
+    # Plain pseudo_label of the previous accepted sample in this dataset stream.
+    # Used by the trainer's condition_on_prev_probability (prompt conditioning).
+    prev_text: Optional[str] = None
 
 
 @dataclass
@@ -446,21 +459,8 @@ def generate_content_hash(audio_array: np.ndarray, text: str, dataset_name: str)
     NOTE: DO NOT change hash length without migration strategy!
     Existing processed IDs use 16-char hashes.
     """
-    hasher = hashlib.md5()
-
-    # Hash audio content (first 4000 samples = ~0.25s at 16kHz)
-    # Using tobytes() is fast and deterministic for same audio
-    audio_slice = audio_array[:4000] if len(audio_array) > 4000 else audio_array
-    hasher.update(audio_slice.tobytes())
-
-    # Hash the text
-    hasher.update(text.encode('utf-8'))
-
-    # Include dataset name
-    hasher.update(dataset_name.encode('utf-8'))
-
-    # Return formatted ID: {dataset}_{hash16}
-    return f"{dataset_name}_{hasher.hexdigest()[:16]}"
+    # Delegated to the torch-free, unit-tested implementation (single source of truth).
+    return content_hash(audio_array, text, dataset_name)
 
 
 class ThreadedPrefetcher:
@@ -1152,6 +1152,77 @@ class CrisperWhisperTeacher:
 
         return [t.strip() for t in transcriptions]
 
+    @torch.inference_mode()
+    def generate_pseudo_labels_batch_with_timestamps(
+        self,
+        audio_arrays: List[np.ndarray],
+        sampling_rate: int = 16000,
+        language: str = "en",
+    ) -> List[Tuple[str, str]]:
+        """
+        Like generate_pseudo_labels_batch() but ALSO returns the transcription
+        with Whisper-native segment timestamp tokens (<|x.xx|>).
+
+        This is the faithful distil-whisper v3.5 path: pseudo-labels are generated
+        WITH timestamps so the student can be trained to emit segment timestamps a
+        fraction of the time (training-time `timestamp_probability`). The WER quality
+        gate is still computed on the PLAIN text (timestamps stripped).
+
+        NOTE: This is slower than the timestamp-free path (more decoded tokens +
+        timestamp prediction), so it is opt-in via the `generate_timestamps` config.
+
+        Returns:
+            List of (plain_transcription, timestamped_transcription) tuples.
+            timestamped_transcription keeps the <|x.xx|> tokens but drops the other
+            special tokens (sot / language / task / eot).
+        """
+        if not self._loaded:
+            self.load()
+
+        if not audio_arrays:
+            return []
+
+        processed_audios = []
+        for audio in audio_arrays:
+            if len(audio.shape) > 1:
+                audio = audio.mean(axis=1)
+            if sampling_rate != 16000:
+                audio_tensor = torch.from_numpy(audio).unsqueeze(0).float()
+                resampler = torchaudio.transforms.Resample(sampling_rate, 16000)
+                audio = resampler(audio_tensor).squeeze(0).numpy()
+            if audio.dtype != np.float32:
+                audio = audio.astype(np.float32)
+            processed_audios.append(audio)
+
+        input_features = self.processor(
+            processed_audios,
+            sampling_rate=16000,
+            return_tensors="pt",
+            padding=True
+        ).input_features.to(self.device, dtype=self.dtype)
+
+        # Greedy decoding (num_beams=1) but WITH timestamps so segment <|x.xx|>
+        # tokens are produced. Allow a few more tokens for the timestamp markers.
+        generated = self.model.generate(
+            input_features,
+            language=language,
+            task="transcribe",
+            return_timestamps=True,
+            num_beams=1,
+            max_new_tokens=320,
+        )
+
+        # Plain text (all special tokens, incl. timestamps, removed)
+        plain = self.processor.batch_decode(generated, skip_special_tokens=True)
+        # Timestamped text: keep <|x.xx|> markers, drop sot/lang/task/eot
+        timestamped = self.processor.batch_decode(
+            generated,
+            skip_special_tokens=True,
+            decode_with_timestamps=True,
+        )
+
+        return [(p.strip(), t.strip()) for p, t in zip(plain, timestamped)]
+
 
 class MultiGPUPseudoLabelGenerator:
     """
@@ -1201,6 +1272,18 @@ class MultiGPUPseudoLabelGenerator:
         self.min_duration = 0.0  # No minimum (original distil-whisper has no min filter)
         self.max_duration = 30.0  # Maximum audio duration in seconds
 
+        # Audio persistence (REQUIRED for stage-3 training).
+        # The multi-GPU teacher loop discards audio after inference; without this,
+        # the trainer falls back to zero-filled silence. We persist each ACCEPTED
+        # sample's 16kHz mono audio so stage 3 can load real features.
+        self.save_audio = pseudo_config.get('save_audio', True)
+        self.audio_format = str(pseudo_config.get('audio_format', 'flac')).lower()
+        self.audio_dir = Path(pseudo_config.get('audio_dir', self.pseudo_labels_dir / 'audio'))
+        # Faithful distil-whisper v3.5: generate pseudo-labels WITH Whisper-native
+        # segment timestamp tokens (slower; opt-in). Consumed by the trainer's
+        # timestamp_probability. WER gating still uses the plain (timestamp-free) text.
+        self.generate_timestamps = pseudo_config.get('generate_timestamps', False)
+
         # Batch processing settings for GPU optimization
         batch_config = self.config.get('batch_processing', {})
         base_batch_size = self.config['teacher'].get('pseudo_label_batch_size', 48)
@@ -1208,6 +1291,11 @@ class MultiGPUPseudoLabelGenerator:
         # Auto-adjust batch size based on GPU count and memory
         # Scale batch size per GPU to maximize throughput while avoiding OOM
         self.batch_size = self._calculate_optimal_batch_size(base_batch_size)
+        # Optional hard override of the auto-tuned batch size. Lets a single 4090
+        # push past the conservative default (12) once VRAM headroom is confirmed.
+        force_bs = batch_config.get('force_batch_size')
+        if force_bs:
+            self.batch_size = int(force_bs)
         self.audio_loader_workers = batch_config.get('audio_loader_workers', 8)
 
         # Scale workers with GPU count (more GPUs = more I/O needed)
@@ -1230,11 +1318,14 @@ class MultiGPUPseudoLabelGenerator:
                 cache_dir=self.pseudo_labels_dir,
                 enable_audio_fingerprinting=True,  # Catch near-duplicate audio
             )
+            storage_config = self.config.get('storage', {})
             self.storage_manager = StorageManager(
                 cache_dir=str(Path(os.environ.get('HF_HOME', os.path.expanduser('~/.cache/huggingface')))),
                 output_dir=str(self.pseudo_labels_dir),
-                min_free_space_gb=50.0,  # Keep 50GB free
-                emergency_free_space_gb=20.0,  # Emergency cleanup at 20GB
+                # Defaults suit a 2TB cloud disk; lower these in config for a local
+                # machine (e.g. storage.min_free_space_gb: 10, emergency: 5).
+                min_free_space_gb=float(storage_config.get('min_free_space_gb', 50.0)),
+                emergency_free_space_gb=float(storage_config.get('emergency_free_space_gb', 20.0)),
             )
             self.use_global_dedup = True
             if self.is_main:
@@ -1961,77 +2052,12 @@ class MultiGPUPseudoLabelGenerator:
         return total_removed
 
     def _are_spelling_variants(self, word1: str, word2: str, threshold: float = 0.85) -> bool:
-        """
-        Check if two words are spelling variants (e.g., British vs American).
-
-        Uses difflib.SequenceMatcher to check similarity ratio.
-        Examples: colour/color (0.91), realise/realize (0.86), behaviour/behavior (0.94)
-
-        Args:
-            word1: First word
-            word2: Second word
-            threshold: Similarity threshold (default 0.85 catches most UK/US variants)
-
-        Returns:
-            True if words are similar enough to be considered equivalent
-        """
-        from difflib import SequenceMatcher
-
-        if word1 == word2:
-            return True
-        # Must start with same letter to be a spelling variant
-        if not word1 or not word2 or word1[0] != word2[0]:
-            return False
-        # Check similarity ratio
-        return SequenceMatcher(None, word1, word2).ratio() >= threshold
+        """British/American spelling-variant check. Delegates to wer_utils (unit-tested)."""
+        return are_spelling_variants(word1, word2, threshold)
 
     def _calculate_wer_spelling_tolerant(self, ref_words: list, hyp_words: list) -> float:
-        """
-        Calculate WER with tolerance for British/American spelling variants.
-
-        Uses dynamic programming (Levenshtein distance) but treats spelling variants
-        as matches rather than substitutions.
-
-        Args:
-            ref_words: List of reference words (normalized)
-            hyp_words: List of hypothesis words (normalized)
-
-        Returns:
-            WER as float between 0.0 and 1.0 (or higher)
-        """
-        n = len(ref_words)
-        m = len(hyp_words)
-
-        # Edge cases
-        if n == 0:
-            return 1.0 if m > 0 else 0.0
-        if m == 0:
-            return 1.0
-
-        # DP table for edit distance
-        dp = [[0] * (m + 1) for _ in range(n + 1)]
-
-        # Initialize base cases
-        for i in range(n + 1):
-            dp[i][0] = i  # Deletions
-        for j in range(m + 1):
-            dp[0][j] = j  # Insertions
-
-        # Fill DP table
-        for i in range(1, n + 1):
-            for j in range(1, m + 1):
-                # Check if words match (exact or spelling variant)
-                if self._are_spelling_variants(ref_words[i-1], hyp_words[j-1]):
-                    dp[i][j] = dp[i-1][j-1]  # No cost - words are equivalent
-                else:
-                    dp[i][j] = min(
-                        dp[i-1][j] + 1,      # Deletion
-                        dp[i][j-1] + 1,      # Insertion
-                        dp[i-1][j-1] + 1     # Substitution
-                    )
-
-        # WER = edit_distance / reference_length
-        return dp[n][m] / n
+        """Spelling-tolerant Levenshtein WER over word lists. Delegates to wer_utils (unit-tested)."""
+        return calculate_wer_spelling_tolerant(ref_words, hyp_words)
 
     def _calculate_wer(self, reference: str, hypothesis: str) -> float:
         """
@@ -2043,9 +2069,8 @@ class MultiGPUPseudoLabelGenerator:
         Returns:
             WER as float between 0.0 and 1.0 (or higher for very bad transcriptions)
         """
-        # Check for all-uppercase transcription (erroneous generation from Whisper)
-        # Official distil-whisper filters these out
-        if hypothesis is not None and hypothesis.upper() == hypothesis and len(hypothesis) > 0:
+        # Reject all-uppercase transcription (a known Whisper hallucination signature).
+        if is_all_caps_hallucination(hypothesis):
             return 1.0  # Reject all-caps as error
 
         # Normalize both texts
@@ -2092,21 +2117,12 @@ class MultiGPUPseudoLabelGenerator:
         if not hasattr(self, '_english_normalizer'):
             self._english_normalizer = EnglishTextNormalizer({})
 
-        # Remove bracketed fillers first (CrisperWhisper format: [Um], [Uh], etc.)
-        # Do this BEFORE the normalizer since normalizer may not handle brackets well
-        text = re.sub(r'\[(?:um|uh|er|ah|uhm|erm|hmm|hm|mm|mhm)\]', '', text, flags=re.IGNORECASE)
-
-        # Apply official Whisper English normalizer
-        # This handles: lowercase, punctuation, numbers->words, spelling normalization, etc.
+        # Strip bracketed fillers BEFORE the normalizer (it may not handle brackets well),
+        # apply the official Whisper normalizer, then drop standalone filler words.
+        # The filler logic lives in wer_utils (single source, unit-tested).
+        text = strip_bracketed_fillers(text)
         text = self._english_normalizer(text)
-
-        # Strip standalone filler words (in case they appear without brackets)
-        # These are common in verbatim transcriptions but often missing from ground truth
-        FILLER_WORDS = {'um', 'uh', 'er', 'ah', 'uhm', 'erm', 'hmm', 'hm', 'mm', 'mhm', 'uh huh', 'mm hmm'}
-        words = text.split()
-        words = [w for w in words if w not in FILLER_WORDS]
-
-        return ' '.join(words)
+        return drop_standalone_fillers(text)
 
     def _load_dataset(self, name: str, skip_to: int = 0) -> Tuple[Optional[Iterator], Optional[int]]:
         """
@@ -2652,7 +2668,7 @@ class MultiGPUPseudoLabelGenerator:
 
             # Final sync: Now that ALL ranks have data loaded, use NCCL barrier
             # This is fast because no download is happening - just a quick sync
-            if self.is_distributed:
+            if self.is_distributed and self.world_size > 1:
                 log(f"[CHUNKED_DOWNLOAD] Rank {self.local_rank} at final sync barrier (all data loaded)", 'debug')
                 dist.barrier()
                 log(f"[CHUNKED_DOWNLOAD] Rank {self.local_rank} passed final sync barrier, ready to process", 'debug')
@@ -2961,11 +2977,46 @@ class MultiGPUPseudoLabelGenerator:
             pass
         return None
 
+    def _save_audio_file(
+        self,
+        name: str,
+        sample_id: str,
+        audio_mono: Optional[np.ndarray],
+        sr: int,
+    ) -> Optional[str]:
+        """
+        Persist one accepted sample's audio as 16kHz mono so stage 3 can train on
+        REAL features (the teacher loop otherwise discards audio and the trainer
+        would fall back to zero-filled silence).
+
+        Resamples to 16kHz if needed and writes 16-bit PCM (FLAC by default, ~3-4x
+        smaller than WAV). Returns the absolute path written, or None on
+        failure / when saving is disabled.
+        """
+        if not self.save_audio or audio_mono is None:
+            return None
+        try:
+            import soundfile as sf
+            audio = np.asarray(audio_mono, dtype=np.float32)
+            if sr != 16000:
+                audio_tensor = torch.from_numpy(audio).unsqueeze(0)
+                audio = torchaudio.transforms.Resample(sr, 16000)(audio_tensor).squeeze(0).numpy()
+            out_dir = self.audio_dir / name
+            out_dir.mkdir(parents=True, exist_ok=True)
+            ext = self.audio_format if self.audio_format in ('wav', 'flac') else 'flac'
+            out_path = out_dir / f"{sample_id}.{ext}"
+            # 16-bit PCM keeps files small; soundfile scales float [-1,1] -> int16.
+            sf.write(str(out_path), audio, 16000, subtype='PCM_16')
+            return str(out_path)
+        except Exception as e:
+            log(f"[SAVE_AUDIO] Failed to save audio for {sample_id}: {e}", 'warning')
+            return None
+
     def _process_batch_gpu(
         self,
         batch_data: List[Tuple[np.ndarray, int, str, str, float, int]],
         name: str
-    ) -> List[PseudoLabelEntry]:
+    ) -> List[Tuple[PseudoLabelEntry, Optional[np.ndarray], int]]:
         """
         Process a batch of audio samples with TRUE GPU batching.
 
@@ -2974,7 +3025,9 @@ class MultiGPUPseudoLabelGenerator:
             name: Dataset name
 
         Returns:
-            List of PseudoLabelEntry objects
+            List of (PseudoLabelEntry, mono_audio_array, sample_rate) tuples. The
+            audio array (at its original sample rate, mono) is carried so the write
+            loop can persist audio for the accepted, non-duplicate samples only.
         """
         if not batch_data:
             log(f"[GPU_BATCH] Empty batch received", 'debug')
@@ -3048,11 +3101,22 @@ class MultiGPUPseudoLabelGenerator:
 
         # BATCHED INFERENCE - single GPU call for entire batch!
         try:
-            transcriptions = self.teacher.generate_pseudo_labels_batch(
-                audio_arrays=processed_audios,
-                sampling_rate=sr,
-                language="en",
-            )
+            if self.generate_timestamps:
+                # Faithful v3.5 path: also produce the timestamped transcription.
+                dual = self.teacher.generate_pseudo_labels_batch_with_timestamps(
+                    audio_arrays=processed_audios,
+                    sampling_rate=sr,
+                    language="en",
+                )
+                transcriptions = [d[0] for d in dual]
+                timestamped_transcriptions = [d[1] for d in dual]
+            else:
+                transcriptions = self.teacher.generate_pseudo_labels_batch(
+                    audio_arrays=processed_audios,
+                    sampling_rate=sr,
+                    language="en",
+                )
+                timestamped_transcriptions = [None] * len(transcriptions)
             log(f"[GPU_BATCH] Inference complete: {len(transcriptions)} transcriptions for {len(processed_audios)} inputs", 'debug')
         except Exception as e:
             log(f"[GPU_BATCH] Batch inference error: {e}", 'error')
@@ -3065,11 +3129,12 @@ class MultiGPUPseudoLabelGenerator:
             log(f"[GPU_BATCH] MISMATCH: {len(transcriptions)} transcriptions vs {len(ground_truths)} ground_truths", 'error')
             return []
 
-        # Create entries with WER calculation
+        # Create entries with WER calculation. Each entry is paired with its mono
+        # audio (at the original sample rate) so the write loop can persist audio
+        # for accepted, non-duplicate samples only.
         entries = []
         accepted_count = 0
         rejected_count = 0
-        timestamp = datetime.now().isoformat()
 
         for i, (transcription, ground_truth, sample_id, duration) in enumerate(
             zip(transcriptions, ground_truths, sample_ids, durations)
@@ -3082,17 +3147,19 @@ class MultiGPUPseudoLabelGenerator:
             else:
                 rejected_count += 1
 
-            entries.append(PseudoLabelEntry(
+            entry = PseudoLabelEntry(
                 sample_id=sample_id,
                 dataset=name,
                 ground_truth=ground_truth,
                 pseudo_label=transcription,
-                word_timestamps=[],  # Skip timestamps for speed in batch mode
+                word_timestamps=[],  # Word timestamps not stored here; see pseudo_label_timestamped
                 wer=wer,
                 duration_seconds=duration,
                 accepted=accepted,
-                rejection_reason=None if accepted else f"WER {wer:.2%} > {self.wer_threshold:.0%}"
-            ))
+                rejection_reason=None if accepted else f"WER {wer:.2%} > {self.wer_threshold:.0%}",
+                pseudo_label_timestamped=timestamped_transcriptions[i],
+            )
+            entries.append((entry, processed_audios[i], sr))
 
         log(f"[GPU_BATCH] Batch complete: {len(entries)} entries (accepted={accepted_count}, rejected_wer={rejected_count})", 'debug')
         return entries
@@ -3156,6 +3223,14 @@ class MultiGPUPseudoLabelGenerator:
         config = DATASET_CONFIGS.get(name)
         chunk_size_gb = config.get('chunk_size_gb', 100)
         estimated_sample_size_mb = config.get('estimated_sample_size_mb', 4)
+        # Global override: a bigger chunk on a large local disk means FAR fewer
+        # HuggingFace requests (lower rate-limit risk) + less cache-cleanup churn.
+        # See config `storage.chunk_size_gb` (e.g. 100 in config.local.yaml for 10TiB).
+        chunk_override = self.config.get('storage', {}).get('chunk_size_gb')
+        if chunk_override:
+            chunk_size_gb = float(chunk_override)
+            if self.is_main:
+                console.print(f"[cyan]Chunk size overridden to {chunk_size_gb:.0f}GB (storage.chunk_size_gb)[/cyan]")
 
         self._load_teacher()
 
@@ -3258,13 +3333,25 @@ class MultiGPUPseudoLabelGenerator:
                     self._mark_chunk_completed(name, current_chunk)
                     self._cleanup_chunk_cache(name)
                 else:
-                    # Verification failed - log and continue (dedup will handle on next run)
-                    log(f"[CHUNKED_PROCESS] Chunk {current_chunk + 1} verification INCOMPLETE, continuing anyway", 'warning')
-                    console.print(f"[yellow]Chunk {current_chunk + 1} verification incomplete - continuing anyway[/yellow]")
-                    console.print(f"[dim]Deduplication will handle any gaps on next run[/dim]")
+                    # Verification INCOMPLETE: the "processed >= 80% of expected"
+                    # heuristic did not pass. This is usually a FALSE alarm caused by
+                    # heavy duration/invalid/dedup filtering (the samples ARE accounted
+                    # for), but it can also indicate a genuine processing gap. We still
+                    # advance and clean the cache (otherwise the chunk re-downloads
+                    # forever and the disk fills), but we RECORD the chunk index so it
+                    # is auditable and can be re-processed later (e.g. with --no-resume)
+                    # rather than being silently dropped.
+                    log(f"[CHUNKED_PROCESS] Chunk {current_chunk + 1} verification INCOMPLETE - recording for audit and advancing", 'warning')
+                    console.print(f"[red]⚠ Chunk {current_chunk + 1} verification incomplete[/red]")
+                    console.print(f"[yellow]  Advancing to free disk space; chunk recorded in 'incomplete_chunks' for later re-processing[/yellow]")
+                    audit_info = self._get_chunk_info(name)
+                    incomplete_chunks = audit_info.get('incomplete_chunks', [])
+                    if current_chunk not in incomplete_chunks:
+                        incomplete_chunks.append(current_chunk)
+                        audit_info['incomplete_chunks'] = sorted(incomplete_chunks)
+                        self._save_chunk_info(name, audit_info)
                     self._mark_chunk_completed(name, current_chunk)
-                    # IMPORTANT: Still cleanup cache to free disk space even on incomplete verification
-                    # With 2TB disk limit, we must free space after each chunk
+                    # Still free disk space after each chunk (critical on a small disk)
                     self._cleanup_chunk_cache(name)
 
             # File-based sync between chunks (avoids NCCL timeout during cleanup)
@@ -3352,7 +3439,7 @@ class MultiGPUPseudoLabelGenerator:
                     console.print(f"[cyan]Using ground_truth text deduplication (stable across runs)[/cyan]")
 
             # Synchronize so other GPUs wait for cache to be written
-            if self.is_distributed:
+            if self.is_distributed and self.world_size > 1:
                 dist.barrier()
 
             # Non-main GPUs load from cache (which main just created)
@@ -3360,7 +3447,7 @@ class MultiGPUPseudoLabelGenerator:
                 already_processed_ids = self._load_processed_ids_from_files(name)
 
             # Final sync to ensure all GPUs have loaded before proceeding
-            if self.is_distributed:
+            if self.is_distributed and self.world_size > 1:
                 dist.barrier()
 
         # Always append mode if resuming with existing samples
@@ -3469,6 +3556,11 @@ class MultiGPUPseudoLabelGenerator:
         runtime_processed_texts = set()
         runtime_duplicates_caught = 0
 
+        # Tracks the previous accepted sample's text within this dataset stream so
+        # each accepted entry can record `prev_text` for the trainer's faithful
+        # condition_on_prev_probability prompt conditioning. Resets per dataset/chunk.
+        self._last_accepted_text = None
+
         # Process samples with BATCHING using threaded prefetcher
         log(f"[MAIN_LOOP] Starting main processing loop for {name}, mode={mode}", 'info')
         with open(output_file, mode) as out_f, open(rejected_file, mode) as rej_f:
@@ -3566,7 +3658,7 @@ class MultiGPUPseudoLabelGenerator:
                 batch_written = 0
                 batch_deduped = 0
                 batch_cross_dataset_dupes = 0
-                for entry in entries:
+                for entry, entry_audio, entry_sr in entries:
                     # RUNTIME DEDUP CHECK: Catch duplicates within the same run
                     # The prefetcher checks already_processed_ids (from previous runs)
                     # but doesn't catch duplicates within the current dataset iteration
@@ -3601,6 +3693,17 @@ class MultiGPUPseudoLabelGenerator:
                     # Also update the prefetcher's dedup set so workers can skip future dupes
                     # This is thread-safe because we only add (never remove)
                     prefetcher.already_processed_ids.add(text_key)
+
+                    # For accepted (training) samples: record prev_text for prompt
+                    # conditioning and persist the audio so stage 3 trains on real
+                    # features. Only done here (post-dedup) so we never write orphan
+                    # audio for samples that get skipped.
+                    if entry.accepted:
+                        entry.prev_text = self._last_accepted_text
+                        saved_path = self._save_audio_file(name, entry.sample_id, entry_audio, entry_sr)
+                        if saved_path:
+                            entry.audio_path = saved_path
+                        self._last_accepted_text = entry.pseudo_label
 
                     entry_json = json.dumps(asdict(entry))
 
@@ -3674,8 +3777,10 @@ class MultiGPUPseudoLabelGenerator:
                     # Invalidate cache so it gets rebuilt on next resume
                     # (simpler than incremental updates, and resume is now fast anyway)
                     # NOTE: Must match the cache filename in _load_processed_ids_from_files()
+                    # Only the main process deletes it: the cache is written by the main
+                    # process, so a non-main rank unlinking it here is a multi-GPU race.
                     cache_file = self.pseudo_labels_dir / f'{name}_processed_texts.cache'
-                    if cache_file.exists():
+                    if self.is_main and cache_file.exists():
                         try:
                             cache_file.unlink()
                         except Exception:
@@ -3696,7 +3801,7 @@ class MultiGPUPseudoLabelGenerator:
         # 1. NCCL collectives (barrier, all_reduce) block until ALL GPUs call them
         # 2. If one GPU is stuck in processing loop, others will timeout at the collective
         # 3. File-based signaling is non-blocking and allows timeout-based polling
-        if self.is_distributed:
+        if self.is_distributed and self.world_size > 1:
             try:
                 # Signal this GPU is done by creating a marker file
                 done_marker = self.pseudo_labels_dir / f'{name}_gpu{self.local_rank}_done.marker'
@@ -3885,7 +3990,7 @@ class MultiGPUPseudoLabelGenerator:
                 console.print(f"  • {name}: ~{cfg.get('estimated_hours', 0):,} hours")
 
         # Synchronize before starting
-        if self.is_distributed:
+        if self.is_distributed and self.world_size > 1:
             dist.barrier()
 
         all_progress = {}
@@ -3939,7 +4044,7 @@ class MultiGPUPseudoLabelGenerator:
                         else:
                             all_progress[name] = existing
                         # IMPORTANT: Still need to sync with other GPUs to prevent deadlock
-                        if self.is_distributed:
+                        if self.is_distributed and self.world_size > 1:
                             dist.barrier()
                         continue
 
@@ -3969,7 +4074,7 @@ class MultiGPUPseudoLabelGenerator:
             # Synchronize between datasets using NCCL barrier
             # This is now SAFE because we already coordinated via file markers in _process_dataset_standard
             # All GPUs should reach this point within a reasonable time
-            if self.is_distributed:
+            if self.is_distributed and self.world_size > 1:
                 try:
                     dist.barrier()
                 except Exception as e:
@@ -4182,7 +4287,7 @@ def main():
     )
 
     # Synchronize before merging
-    if dist.is_initialized():
+    if dist.is_initialized() and dist.get_world_size() > 1:
         dist.barrier()
 
     # Merge outputs (main process only)

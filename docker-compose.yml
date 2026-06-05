@@ -1,0 +1,43 @@
+# =============================================================================
+# Distil-CrisperWhisper — local single-RTX-4090 (Docker on WSL2)
+# =============================================================================
+# Usage (from the repo root, inside WSL2):
+#   cp .env.example .env      # then edit: HF_TOKEN, HF_USERNAME, DATA_DIR
+#   docker compose build
+#   docker compose run --rm distil          # interactive shell in the container
+# Inside the container you are at /app/scripts; run the pipeline with
+#   --config ../config.local.yaml   (see LOCAL_4090.md).
+# =============================================================================
+services:
+  distil:
+    build: .
+    image: distil-crisperwhisper:local
+    container_name: distil-crisper
+    # GPU passthrough (needs NVIDIA Container Toolkit on the WSL2 host).
+    gpus: all
+    # Larger /dev/shm so multi-worker dataloaders don't hit "bus error".
+    shm_size: "16gb"
+    env_file:
+      - .env
+    environment:
+      # Stage 2 also sets this internally only if hf_transfer is installed.
+      - HF_HUB_ENABLE_HF_TRANSFER=1
+    volumes:
+      # Code (live-edit on the host, runs in the container).
+      - ./:/app
+      # Host data dir -> /workspace. Point DATA_DIR at a disk with enough room.
+      # Prefer a path on the WSL2 ext4 filesystem (e.g. ~/distil_data) over
+      # /mnt/c|/mnt/d — native ext4 is dramatically faster for dataset I/O.
+      - ${DATA_DIR:-./_workspace}:/workspace
+    working_dir: /app/scripts
+    stdin_open: true
+    tty: true
+
+    # --- If your Docker is too old for the `gpus:` key, delete it and use: ---
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
