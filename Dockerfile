@@ -21,7 +21,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     HF_DATASETS_CACHE=/workspace/hf_cache/datasets \
     TRANSFORMERS_CACHE=/workspace/hf_cache/transformers \
     HUGGINGFACE_HUB_CACHE=/workspace/hf_cache/hub \
-    HF_HUB_DOWNLOAD_TIMEOUT=1800
+    HF_HUB_DOWNLOAD_TIMEOUT=1800 \
+    HF_HUB_DISABLE_XET=1 \
+    HF_XET_CACHE=/workspace/hf_cache/xet
 
 # System dependencies (Python 3.10 + audio libs). Mirrors install_system_deps().
 RUN apt-get update && apt-get install -y --no-install-recommends \

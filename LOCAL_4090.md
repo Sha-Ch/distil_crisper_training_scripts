@@ -126,6 +126,25 @@ docker compose down          # stop/remove the compose container if left running
 ```
 `docker images` should normally show exactly those two tagged images.
 
+### Troubleshooting: `No space left on device` during a download
+If a model/dataset download dies with `No space left on device (os error 28)` even
+though `D:` has TBs free, HF's **Xet** downloader was staging the file on the
+container **overlay** (Docker's WSL2 VM, which lives on **C:** and is easily full),
+not on `/workspace` (= D:). The image now sets `HF_HUB_DISABLE_XET=1` +
+`HF_XET_CACHE=/workspace/hf_cache/xet` to force everything onto D — `git pull` and
+re-run `docker compose run --rm distil` (compose env applies with no rebuild). To
+patch a *running* container without pulling:
+```bash
+export HF_HUB_DISABLE_XET=1
+export HF_XET_CACHE=/workspace/hf_cache/xet
+# then re-run your 02_… command
+```
+If it STILL fails, check the mount: `df -h /workspace` should report ~10 TB on D.
+If it instead shows a small filesystem, the `D:\Storage`→`/workspace` bind mount
+didn't take — verify `DATA_DIR` in `.env` and Docker Desktop file sharing. As a
+durable cleanup, you can also move Docker's disk image off C: in Docker Desktop →
+**Settings → Resources → Advanced → Disk image location**.
+
 ---
 
 ## 4. Smoke test (do this first)
