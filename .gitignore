@@ -24,3 +24,5 @@ Server logs/
 # local scratchpad with secrets — never commit
 toDoList
 _nul
+# stray scratch file
+Copy Of the cat of the file I need to remove ami dataset.txt
