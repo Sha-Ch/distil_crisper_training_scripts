@@ -15,15 +15,48 @@ From a PowerShell window in this folder:
 ```powershell
 .\start.ps1
 ```
-It (1) creates a Python venv and runs the import-light tests, (2) pops a folder
-picker so you **choose the storage drive/folder** — your 10 TiB drive — which holds
-the HF/teacher cache, datasets, pseudo-labels (+audio), checkpoints and output
-(it's mounted at `/workspace` in the container), (3) writes `.env`
-(`DATA_DIR` + HF creds), and (4) prints the Docker next steps. Add `-Build -Run`
-to also build and drop into the container. If PowerShell blocks the script:
+It (1) creates a Python venv and runs the import-light tests, (2) writes `.env`
+(HF creds), and (3) prints the Docker next steps. Add `-Build -Run` to also build
+and drop into the container. If PowerShell blocks the script:
 `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass`.
 
+> **Storage changed:** outputs now live on a **TrueNAS SMB share** (`/workspace`)
+> and the HF cache on a **local docker volume** (`/hf_cache`) — see "Storage
+> architecture" below. The old `DATA_DIR` folder-picker that `start.ps1` still writes
+> is no longer used by docker-compose; set the `SMB_*` vars in `.env` instead
+> (updating `start.ps1` to prompt for them is a TODO).
+
 The rest of this guide is the manual / step-by-step version of the same thing.
+
+---
+
+## Storage architecture
+
+Two locations, each matched to its access pattern:
+
+| What | Where | Why |
+|------|-------|-----|
+| **Outputs** — pseudo-labels (+ FLAC audio), checkpoints, final/CT2 models | **TrueNAS SMB share** at `/workspace` (10 TB, multi-device, Windows-readable) | what you keep; sequential single-writer files CIFS handles fine |
+| **HF cache** — teacher download + dataset Arrow cache | **Local docker volume** at `/hf_cache` (ext4, fast) | transient scratch with a network-hostile access pattern; cycles per dataset |
+
+Why not put the cache on SMB too? `datasets` memory-maps Arrow files and the hub
+cache uses symlinks — both fight CIFS. Keeping the cache on local ext4 avoids that;
+the cache only needs to hold **one dataset (or chunk) at a time** because it is
+**auto-flushed after each dataset** (`storage.flush_dataset_cache_after_completion:
+true` in `config.local.yaml`), so a ~160 GB local disk cycles through any number of
+datasets while the kept audio accumulates on the 10 TB share.
+
+**TrueNAS prerequisite (one-time):** create a ZFS **dataset** + an **SMB share** for
+it (delete the old iSCSI zvol first to free the space — iSCSI block devices can't be
+bind-mounted into WSL2/Docker, which is the whole reason for using SMB). Then set in
+`.env`: `SMB_HOST`, `SMB_SHARE`, `SMB_USER`, `SMB_PASS`. The container mounts the
+share via CIFS; if it can't mount, the container **fails fast** (safer than silently
+writing to the ephemeral overlay).
+
+> A single **non-streaming** dataset whose peak (download + Arrow) exceeds the local
+> cache still won't fit — librispeech-all-splits (~120–180 GB) is the one at risk on
+> a ~160 GB cache. Use a smaller set for the smoke test (`--datasets ami`, ~15 GB);
+> for librispeech either set only its `streaming: true` or process one split.
 
 ---
 
@@ -52,11 +85,13 @@ cp .env.example .env
 # Edit .env:
 #   HF_TOKEN=...        (required; gated datasets + avoids rate limiting)
 #   HF_USERNAME=...     (only if you later enable push_to_hub)
-#   DATA_DIR=/home/<you>/distil_data   (host dir mounted at /workspace)
+#   SMB_HOST=192.168.1.55  SMB_SHARE=distil  SMB_USER=...  SMB_PASS=...
+#                       (TrueNAS SMB share mounted at /workspace — see "Storage architecture")
+#   HF_HUB_ENABLE_HF_TRANSFER=0   (legible download errors; set 1 for speed once stable)
 ```
 
-**Pick `DATA_DIR` on the WSL2 ext4 filesystem** (e.g. `~/distil_data`), not
-`/mnt/c` or `/mnt/d` — native ext4 is far faster for dataset I/O.
+The HF cache goes on a **local** docker volume automatically (no path to set). The
+legacy `DATA_DIR` is no longer used by docker-compose.
 
 ### How much disk? (`DATA_DIR`)
 The currently-configured English mixture is ~50k raw hours (~2.4 TB of downloads),
@@ -68,12 +103,12 @@ at any moment. The real driver is **retained accepted audio** (`save_audio: true
 | Core-5 (LibriSpeech, AMI, TED-LIUM, VoxPopuli, Common Voice) | ~80 GB | days of 4090 time |
 | Full configured mixture (~50k h) | ~0.8 TB | weeks–months of 4090 time |
 
-**With 10 TiB you have ample headroom.** `config.local.yaml` is tuned for it:
-`storage.chunk_size_gb: 100` (a ~100 GB rolling chunk → ~150 GB working set, far
-fewer HuggingFace requests than 20 GB chunks) and `min_free_space_gb: 200 /
-emergency: 100`. Retained FLAC audio for the full mixture is ~0.8 TB; even keeping
-WAV (~2.85 TB) plus the rolling chunk fits comfortably. Only expanding YODAS toward
-its true 150k h would approach the limit.
+**The 10 TB SMB share holds the retained audio** (~80 GB core-5, ~0.8 TB full
+mixture) — ample. The **local HF cache** is the tighter resource: `config.local.yaml`
+is tuned for a ~160 GB local cache (`storage.chunk_size_gb: 40` → ~60 GB working set,
+`min_free_space_gb: 30 / emergency: 15`) and **auto-flushes each dataset's cache** so
+it cycles. A single non-chunked dataset must still fit the local cache at peak (see
+the librispeech note under "Storage architecture").
 
 ### Gated datasets & avoiding rate limits
 **Accept the dataset terms first** (one-time, same HF account as `HF_TOKEN`) or the
@@ -139,11 +174,12 @@ export HF_HUB_DISABLE_XET=1
 export HF_XET_CACHE=/workspace/hf_cache/xet
 # then re-run your 02_… command
 ```
-If it STILL fails, check the mount: `df -h /workspace` should report ~10 TB on D.
-If it instead shows a small filesystem, the `D:\Storage`→`/workspace` bind mount
-didn't take — verify `DATA_DIR` in `.env` and Docker Desktop file sharing. As a
-durable cleanup, you can also move Docker's disk image off C: in Docker Desktop →
-**Settings → Resources → Advanced → Disk image location**.
+If it STILL fails, check both mounts: `df -h /workspace` (the SMB share — should be
+~10 TB) and `df -h /hf_cache` (the local cache volume). A tiny `/workspace` (e.g.
+137 MB) means the SMB mount didn't take — verify the `SMB_*` vars in `.env` and that
+the TrueNAS share is reachable. Note: an **iSCSI** disk cannot be bind-mounted into
+WSL2/Docker (WSL2 only auto-mounts physical fixed disks) — that is exactly why
+`/workspace` uses an **SMB share** (CIFS) here, not a Windows drive path.
 
 ---
 
@@ -239,4 +275,5 @@ verbatim-model penalty the teacher also pays.
 - **Full-scale training** (4096 batch / 80 epochs) is a cloud multi-GPU job — the
   trainer stays multi-GPU-capable via `config.yaml`. The 4090 is for data prep + PoC.
 - **GPU verification only happens here**, not on the Windows host. If a step fails,
-  capture the console output; the scripts also log to `/workspace/logs/`.
+  capture the console output; stage 2 also logs to `/app/logs/` (the repo
+  bind-mount), not `/workspace`.

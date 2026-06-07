@@ -2,7 +2,7 @@
 # Distil-CrisperWhisper — local single-RTX-4090 (Docker on WSL2)
 # =============================================================================
 # Usage (from the repo root, inside WSL2):
-#   cp .env.example .env      # then edit: HF_TOKEN, HF_USERNAME, DATA_DIR
+#   cp .env.example .env      # then edit: HF_TOKEN, HF_USERNAME, SMB_HOST/SHARE/USER/PASS
 #   docker compose build
 #   docker compose run --rm distil          # interactive shell in the container
 # Inside the container you are at /app/scripts; run the pipeline with
@@ -20,22 +20,33 @@ services:
     env_file:
       - .env
     environment:
-      # Stage 2 also sets this internally only if hf_transfer is installed.
-      - HF_HUB_ENABLE_HF_TRANSFER=1
-      # Keep HF's Xet downloader from staging multi-GB files on the container
-      # OVERLAY (which lives in Docker's WSL2 VM on C:, easily full). Disabling Xet
-      # routes downloads through the standard downloader, which stages inside the
-      # cache dir on /workspace (= your DATA_DIR / D:). HF_XET_CACHE is belt-and-
-      # suspenders in case any tool still uses Xet. Fixes "No space left on device".
+      # hf_transfer downloads in parallel but reports opaque errors (it masks the
+      # real "No space left ..." path). Default OFF for legible errors; set
+      # HF_HUB_ENABLE_HF_TRANSFER=1 in .env for faster downloads once storage is stable.
+      - HF_HUB_ENABLE_HF_TRANSFER=${HF_HUB_ENABLE_HF_TRANSFER:-0}
+      # Keep HF's Xet downloader from staging multi-GB files on the container OVERLAY
+      # (Docker's WSL2 VM on C:, easily full). Disabling Xet routes downloads through
+      # the standard downloader, which stages inside the HF cache dir (now /hf_cache,
+      # the local volume below). Fixes "No space left on device".
       - HF_HUB_DISABLE_XET=1
-      - HF_XET_CACHE=/workspace/hf_cache/xet
+      # HF cache (teacher download + dataset Arrow cache) lives on the LOCAL ext4
+      # named volume, NOT the SMB share: it is transient scratch with a
+      # network-hostile access pattern (mmap/symlinks/churn). See LOCAL_4090.md.
+      - HF_HOME=/hf_cache
+      - HF_DATASETS_CACHE=/hf_cache/datasets
+      - TRANSFORMERS_CACHE=/hf_cache/transformers
+      - HUGGINGFACE_HUB_CACHE=/hf_cache/hub
+      - HF_XET_CACHE=/hf_cache/xet
     volumes:
       # Code (live-edit on the host, runs in the container).
       - ./:/app
-      # Host data dir -> /workspace. Point DATA_DIR at a disk with enough room.
-      # Prefer a path on the WSL2 ext4 filesystem (e.g. ~/distil_data) over
-      # /mnt/c|/mnt/d — native ext4 is dramatically faster for dataset I/O.
-      - ${DATA_DIR:-./_workspace}:/workspace
+      # Persistent OUTPUTS (pseudo-labels + audio, checkpoints, output models) on the
+      # TrueNAS SMB share -> 10 TB, multi-device, Windows-readable (defined below).
+      # The share + SMB_* in .env must exist BEFORE running (fails loudly otherwise).
+      - workspace:/workspace
+      # Transient HF cache on a LOCAL ext4 volume that cycles (auto-flush per dataset
+      # via storage.flush_dataset_cache_after_completion). Keeps the teacher cached.
+      - hfcache:/hf_cache
     working_dir: /app/scripts
     stdin_open: true
     tty: true
@@ -48,3 +59,22 @@ services:
     #         - driver: nvidia
     #           count: all
     #           capabilities: [gpu]
+
+# -----------------------------------------------------------------------------
+# Named volumes
+#   hfcache   -> LOCAL ext4 (the docker disk). Transient HF cache; cycles per dataset.
+#   workspace -> TrueNAS SMB share (CIFS). Persistent outputs; multi-device.
+# Set SMB_HOST / SMB_SHARE / SMB_USER / SMB_PASS in .env. The share must exist
+# before running; if it can't mount, the container fails fast — which is safer than
+# silently writing outputs to the ephemeral container overlay.
+# For a quick LOCAL-ONLY smoke test before the SMB share is ready, comment out the
+# `driver` + `driver_opts` under `workspace` so it becomes a plain local volume.
+# -----------------------------------------------------------------------------
+volumes:
+  hfcache:
+  workspace:
+    driver: local
+    driver_opts:
+      type: cifs
+      o: "username=${SMB_USER},password=${SMB_PASS},uid=0,gid=0,file_mode=0664,dir_mode=0775,vers=3.1.1"
+      device: "//${SMB_HOST}/${SMB_SHARE}"

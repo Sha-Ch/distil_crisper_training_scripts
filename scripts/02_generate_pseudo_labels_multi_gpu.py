@@ -2916,6 +2916,37 @@ class MultiGPUPseudoLabelGenerator:
                 console.print(f"[yellow]Cache cleanup warning: {e}[/yellow]")
                 console.print(f"[dim]  (This is non-critical, processing will continue)[/dim]")
 
+    def _flush_dataset_cache(self, name: str) -> None:
+        """
+        Drop the transient HF *datasets* cache (downloads + prepared Arrow) after a
+        dataset is fully processed, so a small local cache disk can cycle through many
+        datasets. Keeps the hub/ cache (the teacher model) intact. Outputs already
+        persist under pseudo_labels_dir (the SMB share), so nothing trainable is lost.
+
+        Gated by storage.flush_dataset_cache_after_completion (off by default → the
+        cloud config is unaffected). Intended for small-disk local runs (config.local).
+        Main process only; mirrors StorageManager.emergency_cleanup's datasets-cache
+        deletion but as a routine step (not an emergency).
+        """
+        if not self.is_main:
+            return
+        try:
+            import shutil
+            hf_home = Path(os.environ.get('HF_HOME', os.path.expanduser('~/.cache/huggingface')))
+            datasets_cache = hf_home / 'datasets'
+            if not datasets_cache.exists():
+                return
+            size_gb = 0.0
+            try:
+                size_gb = sum(f.stat().st_size for f in datasets_cache.rglob('*') if f.is_file()) / (1024 ** 3)
+            except Exception:
+                pass
+            shutil.rmtree(datasets_cache, ignore_errors=True)
+            console.print(f"[cyan]Flushed HF datasets cache after {name} (~{size_gb:.1f}GB freed; teacher kept)[/cyan]")
+            log(f"[CACHE_FLUSH] Removed datasets cache after {name} (~{size_gb:.1f}GB freed)", 'info')
+        except Exception as e:
+            log(f"[CACHE_FLUSH] Failed to flush datasets cache after {name}: {e}", 'warning')
+
     def _process_chunk_with_verification(
         self,
         name: str,
@@ -4089,6 +4120,13 @@ class MultiGPUPseudoLabelGenerator:
                                 marker.unlink()
                         except Exception:
                             pass
+
+            # Small-disk cache cycling: once a dataset is fully processed (and all
+            # ranks synced above), drop its transient HF datasets cache so the next
+            # dataset has room on a small local cache disk. Outputs already persist on
+            # the share; the teacher (hub cache) is kept. Off by default (cloud config).
+            if self.config.get('storage', {}).get('flush_dataset_cache_after_completion', False):
+                self._flush_dataset_cache(name)
 
             # Clear GPU cache
             if torch.cuda.is_available():

@@ -6,14 +6,16 @@
 #
 # Differences vs config.yaml (the cloud/multi-GPU config):
 #   - Single-GPU training batch (8) + larger grad-accum (PoC-friendly)
-#   - storage thresholds lowered for a smaller local disk (10 / 5 GB)
+#   - storage: outputs -> SMB /workspace; HF cache -> LOCAL /hf_cache (cycles per
+#     dataset); thresholds tuned for a ~160 GB local cache (see docker-compose.yml)
 #   - multi_gpu.min_gpus: 1
 #   - push_to_hub: false (enable + set HF_USERNAME if you want Hub pushes)
 #   - same fidelity flags: save_audio, generate_timestamps, timestamp/prev probs,
 #     bpe_dropout, weight_decay 0.0
 #
-# Paths are CONTAINER-INTERNAL (/workspace). docker-compose mounts a host data
-# directory onto /workspace, so everything persists on the host. See LOCAL_4090.md.
+# Paths are CONTAINER-INTERNAL. Outputs live under /workspace (the SMB share);
+# the transient HF cache lives on the LOCAL /hf_cache volume. docker-compose wires
+# both. See LOCAL_4090.md "Storage architecture".
 #
 # Data scope: all 8 datasets are listed (full faithful mixture is supported via
 # chunked download). On one 4090 the giant sets (gigaspeech/peoples_speech/yodas)
@@ -27,7 +29,7 @@ paths:
   data_dir: "/workspace/data"
   checkpoint_dir: "/workspace/checkpoints"
   output_dir: "/workspace/output"
-  hf_cache: "/workspace/hf_cache"
+  hf_cache: "/hf_cache"                    # LOCAL ext4 volume (NOT the SMB /workspace): transient cache
   pseudo_labels_dir: "/workspace/pseudo_labels"
 
 # -----------------------------------------------------------------------------
@@ -251,19 +253,25 @@ multi_gpu:
   max_gpus: 1
 
 # -----------------------------------------------------------------------------
-# Storage watchdog + chunked-download tuning (10 TiB local disk)
+# Storage watchdog + chunked-download tuning
 # -----------------------------------------------------------------------------
+# The HF cache lives on the LOCAL /hf_cache volume (see docker-compose.yml). On a
+# small local cache disk (~160 GB) the working set must stay bounded: the giant
+# sets chunk, and non-chunked sets are flushed after each completes (below). These
+# thresholds apply to the /hf_cache disk that StorageManager watches.
 storage:
-  # Generous headroom on 10 TiB. The watchdog cleans the transient HF *download*
-  # cache (never your retained FLAC audio) when free space dips below these.
-  min_free_space_gb: 200.0
-  emergency_free_space_gb: 100.0
+  # Keep this much free on the local cache disk; clean the transient HF *download*
+  # cache (never the retained FLAC audio, which is on the SMB share) below these.
+  min_free_space_gb: 30.0
+  emergency_free_space_gb: 15.0
   # Chunked-download size for the giant gated datasets (gigaspeech/peoples_speech/
-  # yodas). Bigger chunks = far FEWER HuggingFace requests (lower rate-limit risk)
-  # and less cache-cleanup churn. Overrides the per-dataset chunk_size_gb (20) in
-  # DATASET_CONFIGS. 10 TiB easily fits a 100GB rolling chunk (×1.5 working ≈ 150GB)
-  # plus retained audio. Lower it if you cap DATA_DIR well under 10 TiB.
-  chunk_size_gb: 100
+  # yodas). ~40 GB chunk -> ~60 GB working set, fits a ~160 GB local cache.
+  # Overrides the per-dataset chunk_size_gb (20) in DATASET_CONFIGS.
+  chunk_size_gb: 40
+  # Small-disk cycling: after each NON-chunked dataset is fully processed, drop the
+  # transient HF datasets cache (keeping the teacher) so the next dataset has room.
+  # Outputs already persist on the SMB share. Off (absent) on the cloud config.
+  flush_dataset_cache_after_completion: true
 
 # -----------------------------------------------------------------------------
 # CTranslate2 Conversion
